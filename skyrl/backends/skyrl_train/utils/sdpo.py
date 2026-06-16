@@ -173,12 +173,17 @@ def build_self_distillation_tensors(
         hindsight_text = build_hindsight_prompt_text(prompt_text, demonstration, feedback_text, cfg)
         teacher_messages = prefix + [{"role": "user", "content": hindsight_text}]
 
-        ids = tokenizer.apply_chat_template(
+        # Render to text then tokenize explicitly: apply_chat_template(tokenize=True) can return a
+        # BatchEncoding (not List[int]) depending on the transformers version, which would corrupt the
+        # token list. The two-step is version-robust and yields a flat List[int]. add_special_tokens=
+        # False because the chat template already emits the special/format tokens.
+        text = tokenizer.apply_chat_template(
             teacher_messages,
-            tokenize=True,
+            tokenize=False,
             add_generation_prompt=True,
             **chat_kwargs,
         )
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         if len(ids) > cfg.max_reprompt_len:
             # Left-truncate (drop oldest tokens) so the generation-prompt suffix + final instruction survive.
             logger.warning(
