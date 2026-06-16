@@ -1083,7 +1083,13 @@ def compute_sdpo_loss(
 
     with torch.no_grad():
         denom = mask.sum().clamp(min=1.0)
+        # sdpo_log_ratio = mean_token(student - teacher) over distilled tokens: the reverse-KL gap
+        # SDPO drives to zero (the core self-distillation signal). The component logps + |gap| make
+        # the dynamics legible: teacher should sit above student as the hindsight prompt helps.
         loss_metrics["sdpo_log_ratio"] = ((log_ratio * mask).sum() / denom).item()
+        loss_metrics["sdpo_abs_log_ratio"] = ((log_ratio.abs() * mask).sum() / denom).item()
+        loss_metrics["sdpo_student_logp"] = ((student_log_probs * mask).sum() / denom).item()
+        loss_metrics["sdpo_teacher_logp"] = ((teacher_log_probs * mask).sum() / denom).item()
         loss_metrics["sdpo_active_frac"] = self_distillation_mask.mean().item()
     return loss, loss_metrics
 
