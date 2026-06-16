@@ -128,5 +128,10 @@ class BatchIterator:
             # Per-row sub-sequence lengths for sequence packing (None otherwise);
             # chunked per micro-batch by ``TensorBatch.chunk`` like any other field.
             sub_seq_lengths=batch.get("sub_seq_lengths"),
+            # SDPO teacher inputs (None unless policy_loss_type == "sdpo").
+            teacher_sequences=batch.get("teacher_sequences"),
+            teacher_attention_mask=batch.get("teacher_attention_mask"),
+            self_distillation_mask=batch.get("self_distillation_mask"),
+            sdpo_loss_scale=batch.get("sdpo_loss_scale"),
         )
         return exp

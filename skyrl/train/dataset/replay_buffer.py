@@ -77,6 +77,14 @@ class Experience:
     # Per-row sub-sequence lengths for sequence packing (one 1-D int tensor per
     # packed row); ``None`` when packing is off.
     sub_seq_lengths: Optional[TensorList] = None
+    # SDPO (self-distillation) teacher inputs; present only when ``policy_loss_type == "sdpo"``.
+    # ``teacher_sequences`` is left-padded ``[PAD..., hindsight_prompt, response]`` with its own
+    # seq_len (the hindsight prompt differs from the original); the response is the trailing tokens,
+    # so the same ``num_actions``/``loss_mask`` apply as for the student.
+    teacher_sequences: Optional[Integer[torch.Tensor, "batch teacher_seq_len"]] = None
+    teacher_attention_mask: Optional[Integer[torch.LongTensor, "batch teacher_seq_len"]] = None
+    self_distillation_mask: Optional[Float[torch.Tensor, "batch 1"]] = None
+    sdpo_loss_scale: Optional[Float[torch.Tensor, "batch 1"]] = None
 
     @torch.no_grad()
     def to_device(self, device: torch.device) -> None:
@@ -107,6 +115,14 @@ class Experience:
             self.image_grid_thw = self.image_grid_thw.to(device)
         if self.sub_seq_lengths is not None:
             self.sub_seq_lengths = self.sub_seq_lengths.to(device)
+        if self.teacher_sequences is not None:
+            self.teacher_sequences = to(self.teacher_sequences, device)
+        if self.teacher_attention_mask is not None:
+            self.teacher_attention_mask = to(self.teacher_attention_mask, device)
+        if self.self_distillation_mask is not None:
+            self.self_distillation_mask = to(self.self_distillation_mask, device)
+        if self.sdpo_loss_scale is not None:
+            self.sdpo_loss_scale = to(self.sdpo_loss_scale, device)
 
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)

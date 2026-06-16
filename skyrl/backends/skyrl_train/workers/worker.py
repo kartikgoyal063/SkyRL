@@ -46,6 +46,7 @@ from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
     compute_approx_kl,
+    compute_sdpo_loss,
     ppo_critic_loss,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
@@ -815,15 +816,43 @@ class PolicyWorkerBase(Worker):
                 image_grid_thw=experience.image_grid_thw,
             )
             # loss function
-            # TODO: recompute advantages
-            policy_loss, loss_metrics = current_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
-            )
+            if resolved_loss_name == "sdpo":
+                # SDPO: a second (no-grad) forward of the live policy on the hindsight-augmented
+                # prompt produces the teacher's response log-probs. The response is the same trailing
+                # `num_actions` tokens, so we reuse `num_actions` and `loss_mask`. This self-distillation
+                # loss replaces the policy-gradient loss entirely (see compute_sdpo_loss).
+                assert (
+                    experience.teacher_sequences is not None and experience.sdpo_loss_scale is not None
+                ), "policy_loss_type='sdpo' requires teacher_sequences + sdpo_loss_scale in the batch"
+                with torch.no_grad():
+                    teacher_log_probs = self.model(
+                        experience.teacher_sequences,
+                        num_actions,
+                        attention_mask=experience.teacher_attention_mask,
+                        temperature=self.cfg.algorithm.temperature,
+                        return_output=False,
+                    )
+                policy_loss, loss_metrics = compute_sdpo_loss(
+                    action_log_probs,
+                    teacher_log_probs,
+                    loss_mask=loss_mask,
+                    self_distillation_mask=experience.self_distillation_mask,
+                    sdpo_loss_scale=experience.sdpo_loss_scale,
+                    config=loss_config,
+                    old_log_probs=old_action_log_probs,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
+            else:
+                # loss function
+                # TODO: recompute advantages
+                policy_loss, loss_metrics = current_loss_fn(
+                    action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    config=loss_config,
+                    loss_mask=loss_mask,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":

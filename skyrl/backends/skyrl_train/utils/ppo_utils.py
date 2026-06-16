@@ -453,6 +453,7 @@ class PolicyLossType(StrEnum):
     SAPO = "sapo"
     CROSS_ENTROPY = "cross_entropy"
     IMPORTANCE_SAMPLING = "importance_sampling"
+    SDPO = "sdpo"
 
 
 class PolicyLossRegistry(BaseFunctionRegistry):
@@ -485,6 +486,10 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "cross_entropy": [PolicyLossType.CROSS_ENTROPY, cross_entropy_loss],
             "importance_sampling": [PolicyLossType.IMPORTANCE_SAMPLING, importance_sampling_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
+            # SDPO needs a teacher forward + extra tensors, so it's handled directly in the policy
+            # worker (see compute_sdpo_loss); this placeholder only makes "sdpo" a valid, registered
+            # policy_loss_type for config validation and is never invoked through the registry.
+            "sdpo": [PolicyLossType.SDPO, _sdpo_loss_registry_placeholder],
         }
 
         for pl_name, (pl_type, pl_func) in pl_types.items():
@@ -996,6 +1001,91 @@ def reduce_loss(
     loss_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     return (loss * loss_mask).sum() if loss_mask is not None else loss.sum()
+
+
+def _sdpo_loss_registry_placeholder(*args, **kwargs):
+    """Registry placeholder for ``policy_loss_type="sdpo"``.
+
+    SDPO requires a teacher forward pass and extra per-sample tensors, so it cannot use the generic
+    ``(log_probs, old_log_probs, advantages, ...)`` loss signature. It is invoked directly in the
+    policy worker (``compute_sdpo_loss``); this stub exists only so ``"sdpo"`` is a registered,
+    config-valid policy loss. It must never be called.
+    """
+    raise NotImplementedError(
+        "SDPO is handled directly in the policy worker via compute_sdpo_loss, not through the "
+        "PolicyLossRegistry. Reaching this means the worker's sdpo branch was bypassed."
+    )
+
+
+def compute_sdpo_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    self_distillation_mask: torch.Tensor,
+    sdpo_loss_scale: torch.Tensor,
+    config: AlgorithmConfig,
+    old_log_probs: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """Reverse-KL self-distillation (SDPO) loss; ``policy_loss_type="sdpo"``.
+
+    Per-token objective (alpha=1.0 reverse KL, in policy-gradient form)::
+
+        per_token_loss = (student_log_probs - teacher_log_probs).detach() * student_log_probs
+
+    The teacher is the live policy conditioned on a hindsight-augmented prompt (a successful sibling's
+    demonstration); only the student carries gradient. Masked by ``loss_mask * self_distillation_mask``
+    so only agent response tokens of samples that actually received a demonstration contribute.
+
+    Normalization parity with GRPO: SkyRL bakes the token-mean reduction into the *advantages*
+    (``_normalize_advantages``) and ``reduce_loss`` is a masked sum the worker later multiplies by
+    ``dp_size``. SDPO has no advantage tensor, so the trainer supplies ``sdpo_loss_scale`` (a per-row
+    ``1/N_minibatch`` for ``token_mean``) which we multiply in here — yielding the identical token-mean
+    reduction, so the SDPO and GRPO learning-rate scales are directly comparable.
+
+    Args:
+        student_log_probs: (B, A) unconditioned-policy response log-probs (grad).
+        teacher_log_probs: (B, A) hindsight-conditioned response log-probs (no grad).
+        loss_mask: (B, A) agent/response token mask.
+        self_distillation_mask: (B, 1) 1.0 for samples with a demonstration, else 0.0.
+        sdpo_loss_scale: (B, 1) per-row loss-reduction pre-scale (see above).
+        config: ``AlgorithmConfig`` (uses ``config.sdpo`` and ``config.off_policy_correction``).
+        old_log_probs: (B, A) rollout-time policy log-probs (for the optional IS clip / TIS).
+        rollout_logprobs: (B, A) inference-engine log-probs (for off-policy / TIS correction).
+    """
+    sdpo_cfg = config.sdpo
+    if self_distillation_mask.dim() == 1:
+        self_distillation_mask = self_distillation_mask.unsqueeze(1)
+    mask = loss_mask * self_distillation_mask
+
+    log_ratio = student_log_probs - teacher_log_probs
+    per_token_loss = log_ratio.detach() * student_log_probs
+
+    # Optional importance-sampling clip on exp(student - old): guards against off-policy staleness.
+    if sdpo_cfg.is_clip is not None:
+        if old_log_probs is None:
+            raise ValueError("sdpo.is_clip requires old_log_probs")
+        is_ratio = safe_exp_delta(
+            student_log_probs - old_log_probs, clip=20.0, out_dtype=student_log_probs.dtype
+        ).clamp(max=sdpo_cfg.is_clip)
+        per_token_loss = per_token_loss * is_ratio.detach()
+
+    loss_metrics: dict[str, float] = {}
+    # Reuse the same off-policy (TIS) correction as the GRPO path so the LoRA recipe matches.
+    per_token_loss, mask, off_policy_metrics = apply_off_policy_correction(
+        per_token_loss, old_log_probs, rollout_logprobs, mask, config.off_policy_correction
+    )
+    loss_metrics.update(off_policy_metrics)
+
+    # Pre-scaled sum (mirrors GRPO's normalized advantages); the worker applies the dp_size factor.
+    per_token_loss = per_token_loss * sdpo_loss_scale
+    loss = reduce_loss(per_token_loss, mask)
+
+    with torch.no_grad():
+        denom = mask.sum().clamp(min=1.0)
+        loss_metrics["sdpo_log_ratio"] = ((log_ratio * mask).sum() / denom).item()
+        loss_metrics["sdpo_active_frac"] = self_distillation_mask.mean().item()
+    return loss, loss_metrics
 
 
 def apply_loss_reduction_to_advantages_minibatch(

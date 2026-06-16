@@ -375,6 +375,42 @@ class OffPolicyCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class SDPOConfig(BaseConfig):
+    """Self-distillation (SDPO) config. Active only when ``policy_loss_type == "sdpo"``.
+
+    SDPO conditions a *teacher* (the live policy, run no-grad) on a hindsight-augmented prompt that
+    embeds a *successful sibling rollout* from the same prompt group, then distills the gap between
+    the teacher's and the (unconditioned) student's per-token log-probs over the sample's OWN
+    response back into the student. This minimal port is reverse-KL (``alpha=1.0``):
+    ``per_token_loss = (student_logp - teacher_logp).detach() * student_logp``.
+
+    Task-agnostic by design: SQL, tau-bench, etc. differ only by the templates / threshold / feedback
+    flags below — there is no task-specific code. The demonstration is the model's OWN successful
+    rollout (never the gold answer), so no label leaks.
+    """
+
+    success_reward_threshold: float = 1.0
+    """Minimum per-sample sequence reward for a sibling rollout to be a usable demonstration."""
+    dont_reprompt_on_self_success: bool = True
+    """Exclude a sample's own rollout from its candidate demonstrations (distill from a *different* sibling)."""
+    remove_thinking_from_demonstration: bool = False
+    """Strip ``<think>...</think>`` from the demonstration before embedding it in the hindsight prompt."""
+    is_clip: Optional[float] = None
+    """Optional clip on the IS ratio ``exp(student - old)`` applied to the per-token loss; ``None`` disables."""
+    max_reprompt_len: int = 16384
+    """Max token length of the hindsight prompt (the response is appended after this, separately)."""
+    include_environment_feedback: bool = False
+    """Embed per-sample environment feedback text in the hindsight prompt (e.g. tau-bench user-sim /
+    tool errors, SQL ``<observation>`` errors). Requires feedback to be supplied to the builder; the
+    SQL minimal port leaves this off and relies on the sibling demonstration alone."""
+    environment_feedback_only_without_solution: bool = False
+    """If True, only use feedback when no successful demonstration exists for that sample."""
+    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+    feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+
+
+@dataclass
 class AlgorithmConfig(BaseConfig):
     advantage_estimator: str = "grpo"
     """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, or custom via ``AdvantageEstimatorRegistry``."""
@@ -399,7 +435,9 @@ class AlgorithmConfig(BaseConfig):
     advantage_batch_normalize: bool = False
     value_head_prefix: str = "value_head"
     policy_loss_type: str = "regular"
-    """``"regular"``, ``"dual_clip"``, ``"gspo"``, ``"clip_cov"``, ``"kl_cov"``, or custom via ``PolicyLossRegistry``."""
+    """``"regular"``, ``"dual_clip"``, ``"gspo"``, ``"clip_cov"``, ``"kl_cov"``, ``"sdpo"``, or custom via ``PolicyLossRegistry``.
+    ``"sdpo"`` replaces the policy-gradient loss with self-distillation (see ``sdpo`` below); it is handled
+    directly in the policy worker (needs a teacher forward + extra tensors), not via the loss registry."""
     loss_reduction: str = "token_mean"
     """``"token_mean"``, ``"sequence_mean"``, or ``"seq_mean_token_sum_norm"``. ``max_seq_len`` must be set explicitly for ``"seq_mean_token_sum_norm"``."""
     grpo_norm_by_std: bool = True
@@ -417,6 +455,8 @@ class AlgorithmConfig(BaseConfig):
     """Deprecated: use ``off_policy_correction`` instead."""
     off_policy_correction: OffPolicyCorrectionConfig = field(default_factory=OffPolicyCorrectionConfig)
     sapo: SAPOConfig = field(default_factory=SAPOConfig)
+    sdpo: SDPOConfig = field(default_factory=SDPOConfig)
+    """Self-distillation config; only used when ``policy_loss_type="sdpo"``."""
     value_clip: float = 0.2
     dynamic_sampling: DynamicSamplingConfig = field(default_factory=DynamicSamplingConfig)
     clip_cov: ClipCovConfig = field(default_factory=ClipCovConfig)

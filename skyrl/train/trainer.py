@@ -40,6 +40,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
+from skyrl.backends.skyrl_train.utils.sdpo import build_self_distillation_tensors
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
@@ -341,6 +342,13 @@ class RayPPOTrainer:
                     # 3. Convert GeneratorOutput to TrainingInputBatch
                     with Timer("convert_to_training_input", self.all_timings):
                         training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+
+                    # 3b. SDPO: build teacher (hindsight-conditioned) inputs from successful siblings.
+                    if self.cfg.trainer.algorithm.policy_loss_type == "sdpo":
+                        with Timer("build_self_distillation_inputs", self.all_timings):
+                            training_input = self._add_self_distillation_inputs(
+                                training_input, generator_output, generator_input["prompts"], uids
+                            )
 
                     # 4. Inference and calculate values, log probs, rewards, kl divergence
                     with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -1223,6 +1231,95 @@ class RayPPOTrainer:
 
         return data
 
+    def _add_self_distillation_inputs(
+        self,
+        training_input: TrainingInputBatch,
+        generator_output: GeneratorOutput,
+        prompts: List,
+        uids: List[str],
+    ) -> TrainingInputBatch:
+        """Attach SDPO teacher (hindsight-conditioned) inputs to the training batch.
+
+        For each sample, picks a successful sibling from the same prompt group, builds a
+        hindsight-augmented teacher prompt, and stores left-padded ``teacher_sequences`` +
+        ``teacher_attention_mask`` + ``self_distillation_mask`` aligned with the (already padded)
+        ``training_input``. Task-agnostic — all behavior is driven by ``algorithm.sdpo`` config.
+        """
+        response_ids = generator_output["response_ids"]
+        num_real = len(response_ids)
+        # Rebuilding the teacher prompt from chat messages needs per-sample prompt/response alignment,
+        # which holds for non-step-wise, non-merged rollouts (e.g. SQL). Skip otherwise.
+        if len(prompts) != num_real:
+            logger.warning(
+                f"[sdpo] prompts ({len(prompts)}) != responses ({num_real}); skipping self-distillation "
+                "for this step (unsupported rollout mode, e.g. step-wise / merged multi-turn)."
+            )
+            return training_input
+
+        # Per-sample scalar sequence reward (matches verl's reward_tensor.sum(-1)).
+        seq_rewards = training_input["rewards"][:num_real].sum(dim=-1).tolist()
+
+        built = build_self_distillation_tensors(
+            tokenizer=self.tokenizer,
+            prompt_messages=prompts,
+            response_ids=response_ids,
+            seq_rewards=seq_rewards,
+            uids=list(uids[:num_real]),
+            cfg=self.cfg.trainer.algorithm.sdpo,
+        )
+
+        # Pad teacher tensors up to the (already padded) batch size. Padded rows are masked out via
+        # loss_mask, so their values are irrelevant; self_distillation_mask is padded with 0.
+        pad_size = training_input.batch_size - num_real
+        teacher_sequences = built["teacher_sequences"]
+        teacher_attention_mask = built["teacher_attention_mask"]
+        self_distillation_mask = built["self_distillation_mask"]
+        if pad_size > 0:
+            teacher_sequences = torch.cat([teacher_sequences, teacher_sequences[:1].repeat(pad_size, 1)], dim=0)
+            teacher_attention_mask = torch.cat(
+                [teacher_attention_mask, teacher_attention_mask[:1].repeat(pad_size, 1)], dim=0
+            )
+            self_distillation_mask = torch.cat(
+                [self_distillation_mask, torch.zeros(pad_size, 1, dtype=self_distillation_mask.dtype)], dim=0
+            )
+
+        training_input["teacher_sequences"] = teacher_sequences
+        training_input["teacher_attention_mask"] = teacher_attention_mask
+        training_input["self_distillation_mask"] = self_distillation_mask
+
+        for k, v in built["metrics"].items():
+            self.all_metrics[k] = v
+        return training_input
+
+    @torch.no_grad()
+    def _compute_sdpo_loss_scale(
+        self,
+        data: TrainingInputBatch,
+        mini_batch_boundaries: List[Tuple[int, int]],
+    ) -> TrainingInputBatch:
+        """Per-row loss-reduction pre-scale for SDPO (the counterpart of ``_normalize_advantages``).
+
+        SDPO has no advantage tensor to carry SkyRL's token-mean normalization, so we precompute a
+        per-row ``1/N`` factor that ``compute_sdpo_loss`` multiplies in. ``N`` is the count of
+        *distilled* tokens (``loss_mask * self_distillation_mask``) in the mini-batch, so the effective
+        learning rate stays stable as the fraction of groups with a successful sibling changes over
+        training (rather than shrinking early when few groups succeed).
+        """
+        loss_mask = data["loss_mask"]
+        self_distillation_mask = data["self_distillation_mask"]
+        reduction = self.cfg.trainer.algorithm.loss_reduction
+        if reduction != "token_mean":
+            logger.warning(
+                f"[sdpo] loss_reduction={reduction!r} is not specialized for SDPO; using token_mean scaling."
+            )
+        scale = torch.zeros((loss_mask.shape[0], 1), dtype=torch.float32, device=loss_mask.device)
+        for start_idx, end_idx in mini_batch_boundaries:
+            distilled = loss_mask[start_idx:end_idx] * self_distillation_mask[start_idx:end_idx]
+            denom = distilled.sum().clamp(min=1.0)
+            scale[start_idx:end_idx] = 1.0 / denom
+        data["sdpo_loss_scale"] = scale
+        return data
+
     @torch.no_grad()
     def _normalize_advantages(
         self,
@@ -1289,6 +1386,9 @@ class RayPPOTrainer:
             # Normalize advantages for policy training; critic training does not need this
             prompt_boundaries = data.metadata.get("policy_prompt_boundaries")
             data = self._normalize_advantages(data, boundaries, prompt_boundaries)
+            # SDPO carries its token-mean normalization in a separate per-row scale (no advantages).
+            if self.cfg.trainer.algorithm.policy_loss_type == "sdpo":
+                data = self._compute_sdpo_loss_scale(data, boundaries)
 
         all_metrics: Dict[str, List[float]] = defaultdict(list)
 
