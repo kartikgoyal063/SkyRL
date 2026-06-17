@@ -397,6 +397,18 @@ class SDPOConfig(BaseConfig):
     """Strip ``<think>...</think>`` from the demonstration before embedding it in the hindsight prompt."""
     is_clip: Optional[float] = None
     """Optional clip on the IS ratio ``exp(student - old)`` applied to the per-token loss; ``None`` disables."""
+    full_logit_distillation: bool = False
+    """If True, distill the teacher's full (top-k) next-token *distribution* per token (forward/reverse/JSD
+    KL via ``alpha``) instead of the minimal per-token-logprob reverse-KL. The denser signal the SDPO paper
+    uses; requires ``distillation_topk`` set. Default False preserves the scalar reverse-KL behavior."""
+    distillation_topk: Optional[int] = None
+    """Top-k vocab entries (by the student's logits) to distill over when ``full_logit_distillation`` (e.g. 100)."""
+    alpha: float = 1.0
+    """KL interpolation for full-logit distillation: 0.0 = forward KL (mass-covering, KL(teacher||student)),
+    1.0 = reverse KL (mode-seeking, KL(student||teacher)), in-between = generalized JSD. The scalar path
+    (``full_logit_distillation=False``) only supports reverse KL, so leave at 1.0 there."""
+    distillation_add_tail: bool = True
+    """For top-k distillation, append a tail bucket for the residual probability mass (vs renormalizing the top-k)."""
     max_reprompt_len: int = 16384
     """Max token length of the hindsight prompt (the response is appended after this, separately)."""
     include_environment_feedback: bool = False

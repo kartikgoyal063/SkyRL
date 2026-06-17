@@ -24,6 +24,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import numpy as np
 import ray
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float
 from loguru import logger
 
@@ -1017,6 +1018,42 @@ def _sdpo_loss_registry_placeholder(*args, **kwargs):
     )
 
 
+def _full_logit_topk_kl(
+    student_topk_logp: torch.Tensor,
+    teacher_topk_logp: torch.Tensor,
+    alpha: float,
+    add_tail: bool,
+) -> torch.Tensor:
+    """Per-token KL between student & teacher top-k next-token distributions (both log-probs over the
+    SAME indices, shape (B, A, K)). ``alpha``: 0=forward KL(teacher||student), 1=reverse KL(student||
+    teacher), in-between=generalized JSD. Ported from verl ``compute_self_distillation_loss``. Returns
+    per-token loss (B, A)."""
+
+    def _add_tail(lp: torch.Tensor) -> torch.Tensor:
+        # Append log P(not in top-k) = log(1 - sum exp(lp)) so the K buckets + tail form a distribution.
+        log_s = torch.logsumexp(lp, dim=-1, keepdim=True).clamp(max=-1e-7)
+        tail = torch.log(-torch.expm1(log_s))
+        return torch.cat([lp, tail], dim=-1)
+
+    def _renorm(lp: torch.Tensor) -> torch.Tensor:
+        return lp - torch.logsumexp(lp, dim=-1, keepdim=True)
+
+    s = _add_tail(student_topk_logp) if add_tail else _renorm(student_topk_logp)
+    t = _add_tail(teacher_topk_logp) if add_tail else _renorm(teacher_topk_logp)
+
+    if alpha == 0.0:  # forward KL(teacher || student): student is F.kl_div's `input`
+        kl = F.kl_div(s, t, reduction="none", log_target=True)
+    elif alpha == 1.0:  # reverse KL(student || teacher)
+        kl = F.kl_div(t, s, reduction="none", log_target=True)
+    else:  # generalized Jensen-Shannon divergence
+        a = torch.tensor(alpha, dtype=s.dtype, device=s.device)
+        mixture = torch.logsumexp(torch.stack([s + torch.log1p(-a), t + torch.log(a)]), dim=0)
+        kl_student = F.kl_div(mixture, s, reduction="none", log_target=True)
+        kl_teacher = F.kl_div(mixture, t, reduction="none", log_target=True)
+        kl = torch.lerp(kl_student, kl_teacher, a)
+    return kl.sum(-1)
+
+
 def compute_sdpo_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1026,6 +1063,8 @@ def compute_sdpo_loss(
     config: AlgorithmConfig,
     old_log_probs: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    student_topk_logp: Optional[torch.Tensor] = None,
+    teacher_topk_logp: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """Reverse-KL self-distillation (SDPO) loss; ``policy_loss_type="sdpo"``.
 
@@ -1059,7 +1098,21 @@ def compute_sdpo_loss(
     mask = loss_mask * self_distillation_mask
 
     log_ratio = student_log_probs - teacher_log_probs
-    per_token_loss = log_ratio.detach() * student_log_probs
+    raw_kl = None
+    if sdpo_cfg.full_logit_distillation:
+        if student_topk_logp is None or teacher_topk_logp is None:
+            raise ValueError(
+                "sdpo.full_logit_distillation requires student_topk_logp + teacher_topk_logp "
+                "(set sdpo.distillation_topk and have the worker request top-k from the forward)"
+            )
+        # Distill the full top-k distribution per token (forward/reverse/JSD via alpha) — the dense signal.
+        per_token_loss = _full_logit_topk_kl(
+            student_topk_logp, teacher_topk_logp, sdpo_cfg.alpha, sdpo_cfg.distillation_add_tail
+        )
+        raw_kl = per_token_loss.detach()
+    else:
+        # Minimal per-token reverse-KL (policy-gradient form): only the sampled token's logprob.
+        per_token_loss = log_ratio.detach() * student_log_probs
 
     # Optional importance-sampling clip on exp(student - old): guards against off-policy staleness.
     if sdpo_cfg.is_clip is not None:
@@ -1091,6 +1144,8 @@ def compute_sdpo_loss(
         loss_metrics["sdpo_student_logp"] = ((student_log_probs * mask).sum() / denom).item()
         loss_metrics["sdpo_teacher_logp"] = ((teacher_log_probs * mask).sum() / denom).item()
         loss_metrics["sdpo_active_frac"] = self_distillation_mask.mean().item()
+        if raw_kl is not None:  # full-logit path: the per-token top-k KL value (the actual distillation loss)
+            loss_metrics["sdpo_kl"] = ((raw_kl * mask).sum() / denom).item()
     return loss, loss_metrics
 
 

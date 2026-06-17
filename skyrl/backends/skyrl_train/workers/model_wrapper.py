@@ -256,8 +256,16 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        return_topk_logp: Optional[int] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        SDPO full-logit distillation: pass ``return_topk_logp=k`` to additionally stash, in the returned
+        ``output`` dict, top-k response-token log-probs (``output["topk_logp"]``, ``output["topk_idx"]``).
+        The student path top-k's its own logits; the teacher path passes ``topk_indices`` (the student's
+        indices) so both distributions share support. Requires ``return_output=True`` to read them back.
+        """
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -339,11 +347,30 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
+        # SDPO full-logit distillation: extract top-k response-token log-probs BEFORE the (in-place) gather
+        # below. logp = topk_logits - logsumexp(all_logits) avoids materializing a full (B,A,V) log-softmax.
+        # Student top-k's its own logits; teacher gathers at the student's indices so both share support.
+        # Only sp=1 / int num_actions (no sample packing) supported.
+        if return_topk_logp is not None:
+            assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
+            na = num_actions[0] if isinstance(num_actions, list) else num_actions
+            assert isinstance(na, int), "topk distillation requires an int num_actions (no sample packing)"
+            resp_logits = logits_BSV[:, -na - 1 : -1, :]
+            logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
+            if topk_indices is not None:
+                tk_logits = torch.gather(resp_logits, -1, topk_indices)
+                output["topk_logp"] = tk_logits - logZ
+                output["topk_idx"] = topk_indices
+            else:
+                tk_logits, tk_idx = torch.topk(resp_logits, k=return_topk_logp, dim=-1)
+                output["topk_logp"] = tk_logits - logZ
+                output["topk_idx"] = tk_idx
+
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(
             logits_BSV,
             sequences_rolled,
-            inplace_backward=True,
+            inplace_backward=return_topk_logp is None,
         )
 
         # gather output if sp > 1

@@ -801,6 +801,10 @@ class PolicyWorkerBase(Worker):
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
+        # SDPO full-logit distillation requests top-k logprobs from the student forward (and teacher).
+        sdpo_full_logit = resolved_loss_name == "sdpo" and loss_config.sdpo.full_logit_distillation
+        sdpo_topk = loss_config.sdpo.distillation_topk if sdpo_full_logit else None
+
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
@@ -814,6 +818,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                return_topk_logp=sdpo_topk,
             )
             # loss function
             if resolved_loss_name == "sdpo":
@@ -825,13 +830,27 @@ class PolicyWorkerBase(Worker):
                     experience.teacher_sequences is not None and experience.sdpo_loss_scale is not None
                 ), "policy_loss_type='sdpo' requires teacher_sequences + sdpo_loss_scale in the batch"
                 with torch.no_grad():
-                    teacher_log_probs = self.model(
-                        experience.teacher_sequences,
-                        num_actions,
-                        attention_mask=experience.teacher_attention_mask,
-                        temperature=self.cfg.algorithm.temperature,
-                        return_output=False,
-                    )
+                    if sdpo_full_logit:
+                        # Teacher gathers top-k at the STUDENT's indices so both distributions share support.
+                        teacher_log_probs, teacher_out = self.model(
+                            experience.teacher_sequences,
+                            num_actions,
+                            attention_mask=experience.teacher_attention_mask,
+                            temperature=self.cfg.algorithm.temperature,
+                            return_output=True,
+                            return_topk_logp=sdpo_topk,
+                            topk_indices=output["topk_idx"],
+                        )
+                        teacher_topk_logp = teacher_out["topk_logp"]
+                    else:
+                        teacher_log_probs = self.model(
+                            experience.teacher_sequences,
+                            num_actions,
+                            attention_mask=experience.teacher_attention_mask,
+                            temperature=self.cfg.algorithm.temperature,
+                            return_output=False,
+                        )
+                        teacher_topk_logp = None
                 policy_loss, loss_metrics = compute_sdpo_loss(
                     action_log_probs,
                     teacher_log_probs,
@@ -841,6 +860,8 @@ class PolicyWorkerBase(Worker):
                     config=loss_config,
                     old_log_probs=old_action_log_probs,
                     rollout_logprobs=rollout_action_logprobs,
+                    student_topk_logp=output["topk_logp"] if sdpo_full_logit else None,
+                    teacher_topk_logp=teacher_topk_logp,
                 )
             else:
                 # loss function
