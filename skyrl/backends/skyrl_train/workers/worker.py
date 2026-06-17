@@ -851,14 +851,6 @@ class PolicyWorkerBase(Worker):
                             return_output=False,
                         )
                         teacher_topk_logp = None
-                print(
-                    f"[SDPO-DBG] seq={tuple(sequences.shape)} tseq={tuple(experience.teacher_sequences.shape)} "
-                    f"num_actions={num_actions} act_logp={tuple(action_log_probs.shape)} "
-                    f"teach_logp={tuple(teacher_log_probs.shape)} loss_mask={tuple(loss_mask.shape)} "
-                    f"s_topk_idx={tuple(output['topk_idx'].shape) if sdpo_full_logit else None} "
-                    f"t_topk={tuple(teacher_topk_logp.shape) if teacher_topk_logp is not None else None}",
-                    flush=True,
-                )
                 policy_loss, loss_metrics = compute_sdpo_loss(
                     action_log_probs,
                     teacher_log_probs,
