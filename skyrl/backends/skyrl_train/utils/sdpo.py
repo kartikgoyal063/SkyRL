@@ -81,43 +81,36 @@ def build_hindsight_prompt_text(
     return cfg.reprompt_template.format(prompt=prompt_text, solution=solution_section, feedback=feedback_section)
 
 
-def _assemble_teacher_sequences(
+def _left_pad_concat(
     hindsight_prompt_ids: List[List[int]],
-    response_block: torch.Tensor,
-    response_attn_block: torch.Tensor,
+    response_ids_list: List[List[int]],
     pad_token_id: int,
 ) -> tuple:
-    """Build left-padded teacher sequences ``[PAD..., hindsight_prompt, response_block]`` + attention.
+    """Build left-padded teacher sequences ``[PAD..., hindsight_prompt, response]`` + attention masks.
 
-    ``response_block`` / ``response_attn_block`` (B, R) are the STUDENT's response window — the same
-    fixed-width block the student uses (verl's invariant: identical responses block appended to both
-    prompts, sliced by the same ``response_length`` R). Appending it verbatim makes the teacher's
-    trailing R positions identical to the student's response window — same width (R = num_actions),
-    same tokens, same mask — so the ``[-num_actions-1:-1]`` slice aligns by construction and can never
-    clamp (each row is hindsight(>=1) + R >= R+1 long).
-    """
-    B, R = response_block.shape
-    hp_lens = [len(h) for h in hindsight_prompt_ids]
-    max_total = max(hp_lens) + R
-    sequences = torch.full((B, max_total), pad_token_id, dtype=torch.long)
-    attention = torch.zeros((B, max_total), dtype=torch.long)
-    for i, h in enumerate(hindsight_prompt_ids):
-        L = len(h)
-        start = max_total - (L + R)  # left padding
-        if L:
-            sequences[i, start : start + L] = torch.tensor(h, dtype=torch.long)
-            attention[i, start : start + L] = 1
-        sequences[i, start + L :] = response_block[i].to(torch.long)
-        attention[i, start + L :] = response_attn_block[i].to(torch.long)
-    return sequences, attention
+    Mirrors verl: the response tokens are appended directly after the hindsight prompt (which ends
+    with the assistant generation-prompt), so the response is conditioned exactly as it was generated
+    — just with the demonstration injected upstream. Each row is left-padded to the batch max
+    ``len(hindsight_i) + len(response_i)``; the response is the trailing real tokens, right-aligned in
+    the ``[-num_actions-1:-1]`` slice to match the (shared) loss_mask. No clamping (hindsight >= 1, and
+    ``len(response_i) <= num_actions``, so each row is ``>= num_actions + 1`` long)."""
+    totals = [len(p) + len(r) for p, r in zip(hindsight_prompt_ids, response_ids_list)]
+    max_total = max(totals)
+    sequences, attention_masks = [], []
+    for p, r, total in zip(hindsight_prompt_ids, response_ids_list, totals):
+        pad_len = max_total - total
+        sequences.append([pad_token_id] * pad_len + list(p) + list(r))
+        attention_masks.append([0] * pad_len + [1] * total)
+    return (
+        torch.tensor(sequences, dtype=torch.long),
+        torch.tensor(attention_masks, dtype=torch.long),
+    )
 
 
 def build_self_distillation_tensors(
     tokenizer,
     prompt_messages: List[List[Dict[str, str]]],
     response_ids: List[List[int]],
-    response_block: torch.Tensor,
-    response_attn_block: torch.Tensor,
     seq_rewards: Sequence[float],
     uids: Sequence[Any],
     cfg,
@@ -205,8 +198,8 @@ def build_self_distillation_tensors(
         num_with_demo += int(has_demo)
         num_with_feedback_used += int(use_feedback)
 
-    teacher_sequences, teacher_attention_mask = _assemble_teacher_sequences(
-        hindsight_prompt_ids, response_block, response_attn_block, pad_token_id
+    teacher_sequences, teacher_attention_mask = _left_pad_concat(
+        hindsight_prompt_ids, response_ids, pad_token_id
     )
     self_distillation_mask = torch.tensor(distillation_flags, dtype=torch.float32).unsqueeze(1)
 
