@@ -31,6 +31,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 
 def extract_topk_response_logp(
@@ -86,6 +87,73 @@ def extract_topk_response_logp(
     logp_BSK = pad_input(packed_logp, indices=nnz_indices, batch=batch_size, seqlen=seqlen)
     idx_BSK = pad_input(tk_idx, indices=nnz_indices, batch=batch_size, seqlen=seqlen)
     return logp_BSK[:, -na - 1 : -1, :], idx_BSK[:, -na - 1 : -1, :]
+
+
+def chunked_response_lm_head(
+    hidden_BAH: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    rolled_ids_BA: torch.Tensor,
+    temperature: float,
+    *,
+    k: Optional[int] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+    chunk_size: int = 2048,
+):
+    """Project response-window hidden states through the (frozen) ``lm_head`` IN CHUNKS over positions, so
+    the full ``(B, na, V)`` logits tensor is never materialized at once.
+
+    Args:
+        hidden_BAH: ``(B, na, H)`` response-window hidden states (already scattered/sliced to the response).
+        lm_head_weight: ``(V, H)`` full (gathered) lm_head weight — frozen, so no grad flows to it.
+        rolled_ids_BA: ``(B, na)`` the next-token id each response position predicts (for per-token logp).
+        temperature: logit temperature (matches the unchunked path's ``logits.div_(temperature)``).
+        k: student path — top-k this many vocab entries per position.
+        topk_indices: teacher path — ``(B, na, K)`` indices to gather at (shares the student's support).
+        chunk_size: positions per chunk; peak logit memory is ``chunk_size * V`` regardless of ``na``.
+
+    Returns ``(action_log_probs (B,na), topk_logp (B,na,K), topk_idx (B,na,K), entropy (B,na))``. Each chunk's
+    ``(B, C, V)`` logits are gradient-checkpointed, so they are recomputed (and freed) in the backward rather
+    than retained — this is what bounds memory. Numerically identical to projecting the whole window at once
+    (matmul tiling + per-chunk logsumexp/top-k are exact)."""
+    na = hidden_BAH.shape[1]
+    logp_parts, tlp_parts, tidx_parts, ent_parts = [], [], [], []
+    for c0 in range(0, na, chunk_size):
+        c1 = min(c0 + chunk_size, na)
+        h_c = hidden_BAH[:, c0:c1, :]
+        ids_c = rolled_ids_BA[:, c0:c1]
+        tki_c = topk_indices[:, c0:c1, :] if topk_indices is not None else None
+
+        def _proj(h, ids, tki):
+            logits = torch.matmul(h, lm_head_weight.t())  # (B, c, V)
+            if temperature != 1.0:
+                logits = logits / temperature
+            logZ = torch.logsumexp(logits, dim=-1, keepdim=True)  # (B, c, 1)
+            token_logp = torch.gather(logits, -1, ids.unsqueeze(-1)).squeeze(-1) - logZ.squeeze(-1)
+            if tki is not None:
+                tlp = torch.gather(logits, -1, tki) - logZ
+                tidx = tki
+            else:
+                tvals, tidx = torch.topk(logits, k=k, dim=-1)
+                tlp = tvals - logZ
+            probs = torch.softmax(logits, dim=-1)
+            ent = logZ.squeeze(-1) - (probs * logits).sum(-1)  # H(softmax(logits)) = logZ - E_p[logit]
+            return token_logp, tlp, tidx, ent
+
+        if torch.is_grad_enabled() and h_c.requires_grad:
+            token_logp, tlp, tidx, ent = _ckpt(_proj, h_c, ids_c, tki_c, use_reentrant=False)
+        else:
+            token_logp, tlp, tidx, ent = _proj(h_c, ids_c, tki_c)
+        logp_parts.append(token_logp)
+        tlp_parts.append(tlp)
+        tidx_parts.append(tidx)
+        ent_parts.append(ent)
+
+    return (
+        torch.cat(logp_parts, dim=1),  # (B, na)
+        torch.cat(tlp_parts, dim=1),  # (B, na, K)
+        torch.cat(tidx_parts, dim=1),  # (B, na, K)
+        torch.cat(ent_parts, dim=1),  # (B, na)
+    )
 
 
 class HFModelWrapper(nn.Module):
