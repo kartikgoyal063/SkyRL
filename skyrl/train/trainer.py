@@ -1259,10 +1259,22 @@ class RayPPOTrainer:
         # Per-sample scalar sequence reward (matches verl's reward_tensor.sum(-1)).
         seq_rewards = training_input["rewards"][:num_real].sum(dim=-1).tolist()
 
+        # verl invariant: append the SAME fixed-width responses block to both the student and teacher
+        # prompts, sliced by the same response_length. The student's block is the trailing num_actions
+        # columns of `sequences` (= response_length = loss_mask width), with its own attention mask.
+        # Re-using it verbatim — rather than re-deriving from raw response_ids, whose length can differ
+        # from response_length on some batches — guarantees the teacher's response window is exactly
+        # num_actions wide and token-aligned with the student's (no slice clamping / shape mismatch).
+        num_actions = training_input.metadata["response_length"]
+        response_block = training_input["sequences"][:num_real, -num_actions:]
+        response_attn_block = training_input["attention_mask"][:num_real, -num_actions:]
+
         built = build_self_distillation_tensors(
             tokenizer=self.tokenizer,
             prompt_messages=prompts,
             response_ids=response_ids,
+            response_block=response_block,
+            response_attn_block=response_attn_block,
             seq_rewards=seq_rewards,
             uids=list(uids[:num_real]),
             cfg=self.cfg.trainer.algorithm.sdpo,

@@ -1095,29 +1095,6 @@ def compute_sdpo_loss(
     sdpo_cfg = config.sdpo
     if self_distillation_mask.dim() == 1:
         self_distillation_mask = self_distillation_mask.unsqueeze(1)
-
-    # Align all response tensors to a shared trailing length. The student and teacher forwards run on
-    # different-length sequences (the teacher's hindsight prompt differs from the student's prompt), so
-    # their response slices can come out a few tokens apart on some batches. Responses are right-aligned
-    # (trailing) in both, so trimming each to the last L positions keeps them token-aligned with loss_mask.
-    L = min(student_log_probs.shape[1], teacher_log_probs.shape[1], loss_mask.shape[1])
-    if L != loss_mask.shape[1]:
-        logger.warning(
-            f"[sdpo] response-length mismatch (student={student_log_probs.shape[1]}, "
-            f"teacher={teacher_log_probs.shape[1]}, loss_mask={loss_mask.shape[1]}); aligning to {L}."
-        )
-    student_log_probs = student_log_probs[:, -L:]
-    teacher_log_probs = teacher_log_probs[:, -L:]
-    loss_mask = loss_mask[:, -L:]
-    if old_log_probs is not None:
-        old_log_probs = old_log_probs[:, -L:]
-    if rollout_logprobs is not None:
-        rollout_logprobs = rollout_logprobs[:, -L:]
-    if student_topk_logp is not None:
-        student_topk_logp = student_topk_logp[:, -L:, :]
-    if teacher_topk_logp is not None:
-        teacher_topk_logp = teacher_topk_logp[:, -L:, :]
-
     mask = loss_mask * self_distillation_mask
 
     log_ratio = student_log_probs - teacher_log_probs
