@@ -353,6 +353,11 @@ class HFModelWrapper(nn.Module):
         # Only sp=1 / int num_actions (no sample packing) supported.
         if return_topk_logp is not None:
             assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
+            assert not self.remove_microbatch_padding, (
+                "full-logit SDPO (top-k distillation) requires remove_microbatch_padding=false: sequence "
+                "packing flattens the batch into the packed logits (1, nnz, V), so the top-k can't be "
+                "sliced/un-packed per-sample here. Set trainer.remove_microbatch_padding=false."
+            )
             if topk_indices is not None:
                 # Teacher: slice the SAME number of response positions as the student's top-k. The teacher
                 # sequence is longer (hindsight prompt), so a shared `num_actions` slice would clamp to a
