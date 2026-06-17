@@ -1092,6 +1092,15 @@ def compute_sdpo_loss(
         old_log_probs: (B, A) rollout-time policy log-probs (for the optional IS clip / TIS).
         rollout_logprobs: (B, A) inference-engine log-probs (for off-policy / TIS correction).
     """
+    raise RuntimeError(
+        "[SDPO-SHAPES] "
+        f"student_logp={tuple(student_log_probs.shape)} teacher_logp={tuple(teacher_log_probs.shape)} "
+        f"loss_mask={tuple(loss_mask.shape)} "
+        f"old={None if old_log_probs is None else tuple(old_log_probs.shape)} "
+        f"rollout={None if rollout_logprobs is None else tuple(rollout_logprobs.shape)} "
+        f"student_topk={None if student_topk_logp is None else tuple(student_topk_logp.shape)} "
+        f"teacher_topk={None if teacher_topk_logp is None else tuple(teacher_topk_logp.shape)}"
+    )
     sdpo_cfg = config.sdpo
     if self_distillation_mask.dim() == 1:
         self_distillation_mask = self_distillation_mask.unsqueeze(1)
