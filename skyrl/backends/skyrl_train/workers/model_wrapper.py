@@ -353,15 +353,21 @@ class HFModelWrapper(nn.Module):
         # Only sp=1 / int num_actions (no sample packing) supported.
         if return_topk_logp is not None:
             assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
-            na = num_actions[0] if isinstance(num_actions, list) else num_actions
-            assert isinstance(na, int), "topk distillation requires an int num_actions (no sample packing)"
-            resp_logits = logits_BSV[:, -na - 1 : -1, :]
-            logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
             if topk_indices is not None:
-                tk_logits = torch.gather(resp_logits, -1, topk_indices)
-                output["topk_logp"] = tk_logits - logZ
+                # Teacher: slice the SAME number of response positions as the student's top-k. The teacher
+                # sequence is longer (hindsight prompt), so a shared `num_actions` slice would clamp to a
+                # different length than the student's; we take `a_len` from the student's indices instead.
+                a_len = topk_indices.shape[1]
+                resp_logits = logits_BSV[:, -a_len - 1 : -1, :]
+                logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
+                output["topk_logp"] = torch.gather(resp_logits, -1, topk_indices) - logZ
                 output["topk_idx"] = topk_indices
             else:
+                # Student: top-k over its own response logits; length matches action_log_probs' slice.
+                na = num_actions[0] if isinstance(num_actions, list) else num_actions
+                assert isinstance(na, int), "topk distillation requires an int num_actions (no sample packing)"
+                resp_logits = logits_BSV[:, -na - 1 : -1, :]
+                logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
                 tk_logits, tk_idx = torch.topk(resp_logits, k=return_topk_logp, dim=-1)
                 output["topk_logp"] = tk_logits - logZ
                 output["topk_idx"] = tk_idx
