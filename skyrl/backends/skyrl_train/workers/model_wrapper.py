@@ -33,6 +33,61 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
 )
 
 
+def extract_topk_response_logp(
+    logits: torch.Tensor,
+    num_actions: int,
+    k: int,
+    *,
+    remove_microbatch_padding: bool,
+    attention_mask: Optional[torch.Tensor] = None,
+    nnz_indices: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+):
+    """SDPO top-k response-token log-probs over the ``num_actions`` response window.
+
+    Returns ``(topk_logp, topk_idx)``, each ``(B, num_actions, k)``. ``logp = topk_logits -
+    logsumexp(all_logits)`` is exact (top-k, not renormalized). The student (``topk_indices=None``) top-k's
+    its own logits; the teacher passes the student's indices and gathers there so both share support.
+
+    Handles both layouts of ``logits``:
+      * unpacked ``(B, S, V)`` — slice the response window, then top-k;
+      * packed ``(1, nnz, V)`` (sample packing, logits over REAL tokens only) — top-k per packed position,
+        scatter ``(nnz, k) -> (B, S, k)`` with the SAME ``nnz_indices`` used for ``log_probs``, then slice
+        the response window so it aligns position-for-position with the student. Packed mode requires
+        ``attention_mask`` (the original ``(B, S)``) and ``nnz_indices``.
+    """
+    na = num_actions
+    if not remove_microbatch_padding:
+        resp_logits = logits[:, -na - 1 : -1, :]
+        logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
+        if topk_indices is not None:
+            return torch.gather(resp_logits, -1, topk_indices) - logZ, topk_indices
+        tk_logits, tk_idx = torch.topk(resp_logits, k=k, dim=-1)
+        return tk_logits - logZ, tk_idx
+
+    # Packed. K (=100) is tiny, so the (B, S, k) scatter is cheap; the win is computing the V-wide softmax
+    # only over real tokens instead of the globally-padded sequence length (what verl's dp_actor does).
+    batch_size, seqlen = attention_mask.shape
+    packed_logits = logits.squeeze(0)  # (nnz, V)
+    logZ = torch.logsumexp(packed_logits, dim=-1, keepdim=True)  # (nnz, 1)
+    if topk_indices is not None:
+        # Teacher: lift the student's (B, na, k) response-window indices into THIS forward's packed layout
+        # (place at the response window, unpad with the shared nnz_indices), gather, scatter + slice back.
+        kk = topk_indices.shape[-1]
+        idx_BSK = topk_indices.new_zeros((batch_size, seqlen, kk))
+        idx_BSK[:, -na - 1 : -1, :] = topk_indices
+        packed_idx = idx_BSK.reshape(batch_size * seqlen, kk)[nnz_indices]  # (nnz, k)
+        packed_logp = torch.gather(packed_logits, -1, packed_idx) - logZ  # (nnz, k)
+        logp_BSK = pad_input(packed_logp, indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+        return logp_BSK[:, -na - 1 : -1, :], topk_indices
+    # Student: top-k its own packed logits, scatter values + indices back, slice.
+    tk_logits, tk_idx = torch.topk(packed_logits, k=k, dim=-1)  # (nnz, k) each
+    packed_logp = tk_logits - logZ  # (nnz, k)
+    logp_BSK = pad_input(packed_logp, indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+    idx_BSK = pad_input(tk_idx, indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+    return logp_BSK[:, -na - 1 : -1, :], idx_BSK[:, -na - 1 : -1, :]
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -347,31 +402,29 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
-        # SDPO full-logit distillation: extract top-k response-token log-probs BEFORE the (in-place) gather
-        # below. logp = topk_logits - logsumexp(all_logits) avoids materializing a full (B,A,V) log-softmax.
-        # Student top-k's its own logits; teacher gathers at the student's indices so both share support.
-        # Only sp=1 / int num_actions (no sample packing) supported.
+        # SDPO full-logit distillation: stash top-k response-token log-probs in `output`. Supports BOTH
+        # the packed (remove_microbatch_padding=True -> logits are (1, nnz, V) over REAL tokens only) and
+        # the unpacked ((B, S, V)) layouts. logp = topk_logits - logsumexp(all_logits) is exact (top-k,
+        # not renormalized). The student top-k's its own logits; the teacher gathers at the student's
+        # indices (`topk_indices`, already the (B, num_actions, K) response window) so both distributions
+        # share support. In packed mode we reuse the same `nnz_indices` / `pad_input` round-trip as the
+        # `log_probs` computation below, so the response-window slice `[-na-1:-1]` aligns position-for-
+        # position with the student (this is what verl's dp_actor does, and it drops the padding the
+        # unpacked path pays for on every micro-forward). Extracted BEFORE the gather below, which runs
+        # with inplace_backward=False for SDPO so `logits_BSV` is left intact. (sp>1 not yet supported.)
         if return_topk_logp is not None:
             assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
-            assert not self.remove_microbatch_padding, (
-                "full-logit SDPO (top-k distillation) requires remove_microbatch_padding=false: sequence "
-                "packing flattens the batch into the packed logits (1, nnz, V), so the top-k can't be "
-                "sliced/un-packed per-sample here. Set trainer.remove_microbatch_padding=false."
-            )
-            # Both student and teacher slice the same response_length window (= num_actions), exactly as
-            # the action-logprob slice below — verl's invariant. Student top-k's its own logits; teacher
-            # gathers at the student's indices so both top-k distributions share support.
             na = num_actions[0] if isinstance(num_actions, list) else num_actions
-            assert isinstance(na, int), "topk distillation requires an int num_actions (no sample packing)"
-            resp_logits = logits_BSV[:, -na - 1 : -1, :]
-            logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
-            if topk_indices is not None:
-                output["topk_logp"] = torch.gather(resp_logits, -1, topk_indices) - logZ
-                output["topk_idx"] = topk_indices
-            else:
-                tk_logits, tk_idx = torch.topk(resp_logits, k=return_topk_logp, dim=-1)
-                output["topk_logp"] = tk_logits - logZ
-                output["topk_idx"] = tk_idx
+            assert isinstance(na, int), "topk distillation requires an int num_actions"
+            output["topk_logp"], output["topk_idx"] = extract_topk_response_logp(
+                logits_BSV,
+                na,
+                return_topk_logp,
+                remove_microbatch_padding=self.remove_microbatch_padding,
+                attention_mask=attention_mask,
+                nnz_indices=nnz_indices if self.remove_microbatch_padding else None,
+                topk_indices=topk_indices,
+            )
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(
