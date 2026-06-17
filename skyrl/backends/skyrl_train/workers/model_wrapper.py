@@ -31,19 +31,6 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
-from torch.utils.checkpoint import checkpoint as _ckpt
-
-
-def _topk_logp(logits: torch.Tensor, k: int, topk_indices: Optional[torch.Tensor]):
-    """SDPO top-k response log-probs. ``logZ`` is the logsumexp over the FULL vocab so the log-probs are
-    exact (top-k, not renormalized). Run under gradient checkpointing (verl-style) so the ``(positions, V)``
-    softmax for ``logZ``'s backward is recomputed in the backward instead of retained from the forward.
-    Teacher path gathers at the student's indices; student path top-k's its own."""
-    logZ = torch.logsumexp(logits, dim=-1, keepdim=True)
-    if topk_indices is not None:
-        return torch.gather(logits, -1, topk_indices) - logZ, topk_indices
-    tk_logits, tk_idx = torch.topk(logits, k=k, dim=-1)
-    return tk_logits - logZ, tk_idx
 
 
 class HFModelWrapper(nn.Module):
@@ -377,14 +364,14 @@ class HFModelWrapper(nn.Module):
             na = num_actions[0] if isinstance(num_actions, list) else num_actions
             assert isinstance(na, int), "topk distillation requires an int num_actions (no sample packing)"
             resp_logits = logits_BSV[:, -na - 1 : -1, :]
-            # Gradient-checkpoint the top-k extraction (verl-style): the full-vocab logsumexp softmax is
-            # recomputed in the backward instead of retained across the rest of the step (teacher forward +
-            # loss + backward), where it otherwise piles up. Teacher forward runs under no_grad -> plain call.
-            if torch.is_grad_enabled() and resp_logits.requires_grad:
-                tlp, tidx = _ckpt(_topk_logp, resp_logits, return_topk_logp, topk_indices, use_reentrant=False)
+            logZ = torch.logsumexp(resp_logits, dim=-1, keepdim=True)
+            if topk_indices is not None:
+                output["topk_logp"] = torch.gather(resp_logits, -1, topk_indices) - logZ
+                output["topk_idx"] = topk_indices
             else:
-                tlp, tidx = _topk_logp(resp_logits, return_topk_logp, topk_indices)
-            output["topk_logp"], output["topk_idx"] = tlp, tidx
+                tk_logits, tk_idx = torch.topk(resp_logits, k=return_topk_logp, dim=-1)
+                output["topk_logp"] = tk_logits - logZ
+                output["topk_idx"] = tk_idx
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(
