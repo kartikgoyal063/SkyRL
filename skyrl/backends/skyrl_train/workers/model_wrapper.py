@@ -32,6 +32,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     logprobs_from_logits,
 )
 from torch.utils.checkpoint import checkpoint as _ckpt
+from torch.distributed.tensor import DTensor
 
 
 def extract_topk_response_logp(
@@ -439,6 +440,15 @@ class HFModelWrapper(nn.Module):
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
 
+        # SDPO full-logit: request hidden states and SKIP the model's own (nnz, V) projection
+        # (logits_to_keep=1 -> lm_head runs on 1 position only). We then apply the lm_head in chunks
+        # ourselves (chunked branch below), bounding peak logit memory to chunk_size*V regardless of length.
+        sdpo_chunked = return_topk_logp is not None
+        if sdpo_chunked:
+            assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
+            assert not self.is_vlm, "topk distillation not supported for VLM inputs"
+        hs_kwargs = dict(output_hidden_states=True, logits_to_keep=1) if sdpo_chunked else {}
+
         if self.is_vlm:
             # NOTE: transformers v5 introduced `mm_token_type_ids` to distinguish text
             # vs. multimodal tokens, and expects it to be populated at tokenization.
@@ -463,36 +473,48 @@ class HFModelWrapper(nn.Module):
         elif self.remove_microbatch_padding and self.attn_implementation == "flash_attention_2":
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
-            output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
+            output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd, **hs_kwargs)
         else:
-            output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+            output = self.model(
+                sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd, **hs_kwargs
+            )
+
+        if sdpo_chunked:
+            # ---- Chunked lm_head: project ONLY the response window, in chunks, from hidden states ----
+            # The model returned hidden states (not the full (nnz, V) logits). Scatter them back to (B, S, H)
+            # (cheap: H << V), slice the response window, and project through the frozen lm_head in chunks so
+            # the (B, C, V) logits are never all-resident. logp = topk_logits - logsumexp(all_logits) is exact.
+            # Student top-k's its own logits; teacher gathers at the student's (B, na, K) indices. Output
+            # shapes are drop-in identical to the non-chunked path.
+            na = num_actions[0] if isinstance(num_actions, list) else num_actions
+            assert isinstance(na, int), "topk distillation requires an int num_actions"
+            batch_size, seqlen = attention_mask.shape
+            hidden = output["hidden_states"][-1]  # (1, nnz, H) packed or (B, S, H)
+            if self.remove_microbatch_padding:
+                hidden = pad_input(hidden.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+            hidden_resp = hidden[:, -na - 1 : -1, :]  # (B, na, H)
+            rolled_resp = sequences[:, -na:]  # (B, na) — the response token each position predicts
+            action_log_probs, tlp, tidx, ent = chunked_response_lm_head(
+                hidden_resp,
+                self._full_lm_head_weight(),
+                rolled_resp,
+                temperature,
+                k=return_topk_logp if topk_indices is None else None,
+                topk_indices=topk_indices,
+                chunk_size=self.logprobs_chunk_size,
+            )
+            output["topk_logp"], output["topk_idx"] = tlp, tidx
+            if compute_entropy:
+                # scatter response-window entropy (B, na) -> (B, S) so the worker's [-num_actions-1:-1] slice recovers it
+                ent_BS = ent.new_zeros((batch_size, seqlen))
+                ent_BS[:, -na - 1 : -1] = ent if entropy_requires_grad else ent.detach()
+                output["entropy"] = ent_BS
+            if return_output:
+                return (action_log_probs, output)
+            return action_log_probs
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
-
-        # SDPO full-logit distillation: stash top-k response-token log-probs in `output`. Supports BOTH
-        # the packed (remove_microbatch_padding=True -> logits are (1, nnz, V) over REAL tokens only) and
-        # the unpacked ((B, S, V)) layouts. logp = topk_logits - logsumexp(all_logits) is exact (top-k,
-        # not renormalized). The student top-k's its own logits; the teacher gathers at the student's
-        # indices (`topk_indices`, already the (B, num_actions, K) response window) so both distributions
-        # share support. In packed mode we reuse the same `nnz_indices` / `pad_input` round-trip as the
-        # `log_probs` computation below, so the response-window slice `[-na-1:-1]` aligns position-for-
-        # position with the student (this is what verl's dp_actor does, and it drops the padding the
-        # unpacked path pays for on every micro-forward). Extracted BEFORE the gather below, which runs
-        # with inplace_backward=False for SDPO so `logits_BSV` is left intact. (sp>1 not yet supported.)
-        if return_topk_logp is not None:
-            assert self.sequence_parallel_size == 1, "topk distillation not supported with sequence parallelism"
-            na = num_actions[0] if isinstance(num_actions, list) else num_actions
-            assert isinstance(na, int), "topk distillation requires an int num_actions"
-            output["topk_logp"], output["topk_idx"] = extract_topk_response_logp(
-                logits_BSV,
-                na,
-                return_topk_logp,
-                remove_microbatch_padding=self.remove_microbatch_padding,
-                attention_mask=attention_mask,
-                nnz_indices=nnz_indices if self.remove_microbatch_padding else None,
-                topk_indices=topk_indices,
-            )
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(
@@ -563,6 +585,17 @@ class HFModelWrapper(nn.Module):
 
     def gradient_checkpointing_disable(self):
         self.model.gradient_checkpointing_disable()
+
+    def _full_lm_head_weight(self):
+        """Full (gathered) lm_head weight ``(V, H)`` for the manual chunked projection. lm_head is frozen
+        under LoRA (not a LoRA target), so we gather the FSDP2-sharded (DTensor) weight once and cache it —
+        it is constant for the whole run. Returns a detached tensor (no grad flows to the frozen weight)."""
+        if getattr(self, "_lm_head_full", None) is None:
+            w = self.model.get_output_embeddings().weight
+            if isinstance(w, DTensor):
+                w = w.full_tensor()
+            self._lm_head_full = w.detach()
+        return self._lm_head_full
 
 
 def _get_critic_model(
