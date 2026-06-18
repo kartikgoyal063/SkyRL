@@ -178,6 +178,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            create_ema_teacher_adapter=(
+                self.cfg.algorithm.policy_loss_type == "sdpo"
+                and self.cfg.algorithm.sdpo.teacher_regularization == "ema"
+                and self.cfg.policy.model.lora.rank > 0
+            ),
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
@@ -197,6 +202,17 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             assert (
                 self.optimizer is not None and self.scheduler is not None
             ), "FSDP preparation should create optimizer and scheduler"
+
+        # SDPO EMA teacher: the strategy has now materialized + FSDP-wrapped the model (params are real
+        # DTensors on every rank), so seed the frozen EMA adapter == "default" with a one-shot EMA at
+        # rate 1.0. Deferred to here because under meta_init the non-rank-0 params were on the meta
+        # device inside HFModelWrapper.__init__, where an eager copy would fail.
+        if (
+            self.cfg.policy.model.lora.rank > 0
+            and self.cfg.algorithm.policy_loss_type == "sdpo"
+            and self.cfg.algorithm.sdpo.teacher_regularization == "ema"
+        ):
+            self.model.ema_update_teacher(1.0)
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers

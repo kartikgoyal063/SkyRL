@@ -50,6 +50,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     ppo_critic_loss,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
+from skyrl.backends.skyrl_train.workers.model_wrapper import EMA_TEACHER_ADAPTER_NAME
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BatchIterator,
     all_reduce_metrics,
@@ -809,6 +810,14 @@ class PolicyWorkerBase(Worker):
         sdpo_teacher_disable_adapter = (
             resolved_loss_name == "sdpo" and loss_config.sdpo.teacher_regularization == "fixed_initial"
         )
+        # "ema": run the teacher on the frozen EMA-of-student adapter (a rising-but-lagged target that
+        # avoids both the fixed_initial capability ceiling and the live-teacher divergence). The EMA
+        # itself is rolled forward once per optimizer step in optim_step().
+        sdpo_teacher_adapter = (
+            EMA_TEACHER_ADAPTER_NAME
+            if (resolved_loss_name == "sdpo" and loss_config.sdpo.teacher_regularization == "ema")
+            else None
+        )
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -846,6 +855,7 @@ class PolicyWorkerBase(Worker):
                             return_topk_logp=sdpo_topk,
                             topk_indices=output["topk_idx"],
                             disable_adapter=sdpo_teacher_disable_adapter,
+                            teacher_adapter=sdpo_teacher_adapter,
                         )
                         teacher_topk_logp = teacher_out["topk_logp"]
                     else:
@@ -856,6 +866,7 @@ class PolicyWorkerBase(Worker):
                             temperature=self.cfg.algorithm.temperature,
                             return_output=False,
                             disable_adapter=sdpo_teacher_disable_adapter,
+                            teacher_adapter=sdpo_teacher_adapter,
                         )
                         teacher_topk_logp = None
                 policy_loss, loss_metrics = compute_sdpo_loss(
@@ -1011,6 +1022,14 @@ class PolicyWorkerBase(Worker):
         """
         # Perform optimizer step (includes gradient clipping)
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+
+        # SDPO EMA teacher: now that the student ("default") adapter has been updated, roll the frozen
+        # EMA teacher adapter toward it. Once per optimizer step (params are on GPU here, pre-offload).
+        if (
+            self.cfg.algorithm.policy_loss_type == "sdpo"
+            and self.cfg.algorithm.sdpo.teacher_regularization == "ema"
+        ):
+            self.model.ema_update_teacher(self.cfg.algorithm.sdpo.teacher_update_rate)
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item()

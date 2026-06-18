@@ -159,6 +159,11 @@ def chunked_response_lm_head(
     )
 
 
+# SDPO teacher_regularization="ema": name of the second, frozen LoRA adapter that holds the
+# exponential moving average of the trainable "default" adapter (the EMA teacher).
+EMA_TEACHER_ADAPTER_NAME = "ema_teacher"
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -207,6 +212,7 @@ class HFModelWrapper(nn.Module):
         meta_init: bool = False,
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
+        create_ema_teacher_adapter: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -330,6 +336,9 @@ class HFModelWrapper(nn.Module):
                 )
                 self.model = get_peft_model(self.model, lora_config)
 
+                if create_ema_teacher_adapter:
+                    self._setup_ema_teacher_adapter(lora_config)
+
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
                         if isinstance(module, LoraLayer):
@@ -370,6 +379,48 @@ class HFModelWrapper(nn.Module):
             else chunked_entropy_from_logits
         )
 
+    def _setup_ema_teacher_adapter(self, lora_config) -> None:
+        """SDPO ``teacher_regularization="ema"``: add a SECOND, frozen LoRA adapter that tracks an
+        exponential moving average of the trainable ``"default"`` adapter — the EMA teacher.
+
+        Called from ``__init__`` *before* the strategy FSDP-wraps the model, so both adapters get
+        sharded identically and the per-step EMA update (``ema_update_teacher``) is a local-shard
+        elementwise op needing no communication. Only allocation + flag-setting happens here (all
+        meta-safe, mirroring the existing ``get_peft_model`` call): the EMA weights are SEEDED equal
+        to ``"default"`` later, by ``ema_update_teacher(1.0)`` after the strategy materializes the
+        model — under ``meta_init`` the non-rank-0 params live on the meta device until then, so an
+        eager ``copy_`` here would fail. The optimizer is built over all params but no-ops on the
+        frozen adapter (no grad -> AdamW skips it)."""
+        self.model.add_adapter(EMA_TEACHER_ADAPTER_NAME, lora_config)
+        for name, p in self.model.named_parameters():
+            if EMA_TEACHER_ADAPTER_NAME in name:
+                p.requires_grad_(False)
+        # Restore "default" as the active+trainable adapter (add_adapter/set_adapter also toggle
+        # requires_grad; this leaves default trainable and ema_teacher frozen — the resting state).
+        self.model.set_adapter("default")
+
+    def _iter_ema_teacher_pairs(self):
+        """Yield ``(default_tensor, ema_teacher_tensor)`` for every matched LoRA weight (lora_A,
+        lora_B, ...). Used by both the init-copy and the EMA update so they stay in lockstep."""
+        for module in self.model.modules():
+            if not isinstance(module, LoraLayer):
+                continue
+            for layer_name in module.adapter_layer_names:
+                md = getattr(module, layer_name, None)
+                if md is None or "default" not in md or EMA_TEACHER_ADAPTER_NAME not in md:
+                    continue
+                default_l, ema_l = md["default"], md[EMA_TEACHER_ADAPTER_NAME]
+                default_t = default_l.weight if hasattr(default_l, "weight") else default_l
+                ema_t = ema_l.weight if hasattr(ema_l, "weight") else ema_l
+                yield default_t, ema_t
+
+    @torch.no_grad()
+    def ema_update_teacher(self, beta: float) -> None:
+        """``ema <- (1-beta)*ema + beta*default``, elementwise on local FSDP shards. Called once per
+        optimizer step (see ``worker.optim_step``), NOT per microbatch, so ``beta`` is not compounded."""
+        for default_t, ema_t in self._iter_ema_teacher_pairs():
+            ema_t.data.mul_(1.0 - beta).add_(default_t.data, alpha=beta)
+
     def forward(
         self,
         sequences: torch.LongTensor,
@@ -385,6 +436,7 @@ class HFModelWrapper(nn.Module):
         return_topk_logp: Optional[int] = None,
         topk_indices: Optional[torch.Tensor] = None,
         disable_adapter: bool = False,
+        teacher_adapter: Optional[str] = None,
     ) -> torch.Tensor:
         """Returns action log probs.
 
@@ -459,6 +511,14 @@ class HFModelWrapper(nn.Module):
         _adapter_off = contextlib.ExitStack()
         if disable_adapter and hasattr(self.model, "disable_adapter"):
             _adapter_off.enter_context(self.model.disable_adapter())
+        elif teacher_adapter is not None:
+            # SDPO EMA teacher: run THIS forward on the frozen EMA adapter, then restore "default"
+            # (the student forward + the backward that follows must run on "default"). set_adapter
+            # also toggles requires_grad (active -> trainable), so restoration is mandatory — done
+            # via the ExitStack callback (closed right after the transformer forward). The teacher
+            # forward is under no_grad, so the transient trainability flip has no effect on grads.
+            self.model.set_adapter(teacher_adapter)
+            _adapter_off.callback(self.model.set_adapter, "default")
 
         if self.is_vlm:
             # NOTE: transformers v5 introduced `mm_token_type_ids` to distinguish text
