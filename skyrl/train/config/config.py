@@ -707,6 +707,10 @@ class TrainerConfig(BaseConfig):
     ckpt_path: str = field(default_factory=lambda: os.path.expanduser("~/ckpts/"))
     max_ckpts_to_keep: int = -1
     """``-1`` to keep all checkpoints, ``N`` to keep only the last N."""
+    save_ckpt_on_epoch_end: bool = True
+    """Force a checkpoint/hf save at every epoch boundary, on top of ``ckpt_interval``/``hf_save_interval``.
+    Set ``False`` to save ONLY on the interval (avoids per-epoch checkpoint pile-up when epochs are short,
+    e.g. a 512-prompt set with batch 256 → 2 steps/epoch → a save every 2 steps)."""
     ckpt_interval: int = 10
     hf_save_interval: int = -1
     """Save HuggingFace-format model every N steps. ``-1`` to disable."""

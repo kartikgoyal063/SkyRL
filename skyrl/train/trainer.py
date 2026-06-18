@@ -389,11 +389,15 @@ class RayPPOTrainer:
 
                     # 8. conditionally save checkpoints and hf model
                     is_epoch_end = self.global_step % len(self.train_dataloader) == 0
+                    # Only force a save on epoch boundaries if explicitly enabled. With short epochs
+                    # (e.g. 2 steps/epoch) the unconditional epoch-end save piles up 30GB ckpts every
+                    # 2 steps; gating it lets ckpt_interval/hf_save_interval be the sole trigger.
+                    save_on_epoch_end = is_epoch_end and self.cfg.trainer.save_ckpt_on_epoch_end
                     hf_model_save = self.cfg.trainer.hf_save_interval > 0 and (
-                        is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0
+                        save_on_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0
                     )
                     ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
-                        is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+                        save_on_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
                     )
                     will_save_ckpts = force_save or ckpt_interval_save
                     if will_save_ckpts:
