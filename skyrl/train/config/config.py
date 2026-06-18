@@ -391,6 +391,12 @@ class SDPOConfig(BaseConfig):
 
     success_reward_threshold: float = 1.0
     """Minimum per-sample sequence reward for a sibling rollout to be a usable demonstration."""
+    teacher_regularization: str = "none"
+    """How to anchor the self-teacher (prevents the live teacher diverging — SDPO Table 4 / OPSD). "none" =
+    live current policy (unregularized; can diverge). "fixed_initial" = teacher is theta_ref = the base model
+    (LoRA disabled), i.e. OPSD's frozen-initial teacher. "ema" = EMA of the student adapter (not yet implemented)."""
+    teacher_update_rate: float = 0.05
+    """EMA decay rate for teacher_regularization="ema" (SDPO main-run value); unused otherwise."""
     dont_reprompt_on_self_success: bool = True
     """Exclude a sample's own rollout from its candidate demonstrations (distill from a *different* sibling)."""
     remove_thinking_from_demonstration: bool = False

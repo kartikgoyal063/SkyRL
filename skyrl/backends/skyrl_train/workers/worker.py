@@ -804,6 +804,11 @@ class PolicyWorkerBase(Worker):
         # SDPO full-logit distillation requests top-k logprobs from the student forward (and teacher).
         sdpo_full_logit = resolved_loss_name == "sdpo" and loss_config.sdpo.full_logit_distillation
         sdpo_topk = loss_config.sdpo.distillation_topk if sdpo_full_logit else None
+        # "fixed_initial": run the teacher with the LoRA adapter disabled -> teacher = base = theta_ref
+        # (OPSD-style frozen-initial teacher; prevents the live-teacher divergence diagnosed in SDPO Table 4).
+        sdpo_teacher_disable_adapter = (
+            resolved_loss_name == "sdpo" and loss_config.sdpo.teacher_regularization == "fixed_initial"
+        )
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -840,6 +845,7 @@ class PolicyWorkerBase(Worker):
                             return_output=True,
                             return_topk_logp=sdpo_topk,
                             topk_indices=output["topk_idx"],
+                            disable_adapter=sdpo_teacher_disable_adapter,
                         )
                         teacher_topk_logp = teacher_out["topk_logp"]
                     else:
@@ -849,6 +855,7 @@ class PolicyWorkerBase(Worker):
                             attention_mask=experience.teacher_attention_mask,
                             temperature=self.cfg.algorithm.temperature,
                             return_output=False,
+                            disable_adapter=sdpo_teacher_disable_adapter,
                         )
                         teacher_topk_logp = None
                 policy_loss, loss_metrics = compute_sdpo_loss(

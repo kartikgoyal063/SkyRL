@@ -5,6 +5,8 @@
 
 from typing import Any, Dict, Optional, Union
 
+import contextlib
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -382,6 +384,7 @@ class HFModelWrapper(nn.Module):
         mm_token_type_ids: Optional[torch.Tensor] = None,
         return_topk_logp: Optional[int] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        disable_adapter: bool = False,
     ) -> torch.Tensor:
         """Returns action log probs.
 
@@ -449,6 +452,14 @@ class HFModelWrapper(nn.Module):
             assert not self.is_vlm, "topk distillation not supported for VLM inputs"
         hs_kwargs = dict(output_hidden_states=True, logits_to_keep=1) if sdpo_chunked else {}
 
+        # Teacher-regularization "fixed_initial": run the transformer with the LoRA adapter DISABLED, so the
+        # teacher is the base model = theta_ref (LoRA inits B=0 -> initial adapter contributes 0). This is
+        # OPSD's frozen-initial teacher / SDPO's stable q_theta_ref, and prevents the live-teacher divergence.
+        # Only the transformer forward needs it (lm_head is the frozen base weight, unaffected); closed right after.
+        _adapter_off = contextlib.ExitStack()
+        if disable_adapter and hasattr(self.model, "disable_adapter"):
+            _adapter_off.enter_context(self.model.disable_adapter())
+
         if self.is_vlm:
             # NOTE: transformers v5 introduced `mm_token_type_ids` to distinguish text
             # vs. multimodal tokens, and expects it to be populated at tokenization.
@@ -478,6 +489,7 @@ class HFModelWrapper(nn.Module):
             output = self.model(
                 sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd, **hs_kwargs
             )
+        _adapter_off.close()  # re-enable the adapter for everything after the transformer forward
 
         if sdpo_chunked:
             # ---- Chunked lm_head: project ONLY the response window, in chunks, from hidden states ----
