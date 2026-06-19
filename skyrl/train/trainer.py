@@ -433,6 +433,17 @@ class RayPPOTrainer:
                     )
                 # log epoch info
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
+                # Cumulative rollouts (trajectories) generated so far. This is the sample-efficiency
+                # x-axis: it is comparable across runs with different batch sizes (step count is not).
+                # Exact because the dataloader uses drop_last (every step is batch_size * n_samples
+                # trajectories). Logged every step; W&B can use it as a custom x-axis. For runs that
+                # predate this metric, the same value is recomputed from config at plot time (see
+                # scripts/plot_rollouts.py) since train_batch_size and n_samples_per_prompt are in config.
+                self.all_metrics["trainer/cumulative_rollouts"] = (
+                    self.global_step
+                    * self.cfg.trainer.train_batch_size
+                    * self.cfg.generator.n_samples_per_prompt
+                )
                 interval_eval = self.cfg.trainer.eval_interval > 0 and (
                     self.global_step % self.cfg.trainer.eval_interval == 0
                     or self.global_step == self.total_training_steps
