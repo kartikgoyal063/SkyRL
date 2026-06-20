@@ -443,10 +443,10 @@ class SDPOConfig(BaseConfig):
     ground_truth_transition_prompt: str = (
         "\nAfter studying the reference solution above, make sure you truly understand why it correctly "
         "answers the question against the given database schema — do not copy or paraphrase it. Now, "
-        "using your own independent reasoning, work through the problem yourself: reason inside "
-        "<think>...</think>, explore the database with <sql>...</sql> queries when it helps, and don't be "
-        "afraid to backtrack or reconsider if something doesn't work out. When you are confident, commit "
-        "your final query inside a single <solution>...</solution> block.\n"
+        "using your own independent reasoning, solve the problem yourself: reason inside <think>...</think>, "
+        "use <sql>...</sql> queries only when you need to inspect the schema or data, and work efficiently "
+        "— commit your final query within your turn budget. Put your final query inside a single "
+        "<solution>...</solution> block.\n"
     )
     """OPSD anti-copy transition appended after the reference: pushes the teacher off literal answer-
     copying and onto a genuine independent-reasoning trajectory the answer-blind student can approximate."""
