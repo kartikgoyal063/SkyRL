@@ -81,6 +81,50 @@ def build_hindsight_prompt_text(
     return cfg.reprompt_template.format(prompt=prompt_text, solution=solution_section, feedback=feedback_section)
 
 
+def build_ground_truth_hindsight_text(prompt_text: str, ground_truth: str, cfg) -> str:
+    """OPSD-style teacher user turn: original prompt + the gold framed as a *reference solution* +
+    an anti-copy transition ("understand why it's correct, do NOT copy, now derive it yourself").
+
+    This mirrors OPSD's non-``reason_first`` teacher prompt (lasgroup OPSD ``data_collator.py``): the
+    point is to push the teacher's next-token distribution OFF literal answer-copying and onto a genuine
+    independent-reasoning trajectory — which is what the answer-blind student can actually approximate.
+    Used only when ``cfg.use_ground_truth_demonstration``; the sibling-demonstration path is unchanged.
+    """
+    reference = cfg.ground_truth_reference_template.format(ground_truth=ground_truth)
+    return prompt_text + reference + cfg.ground_truth_transition_prompt
+
+
+def build_sdpo_feedback(
+    seq_rewards: Sequence[float],
+    completions: Sequence[str],
+    cfg,
+) -> List[Optional[str]]:
+    """Per-sample environment-feedback strings, keyed on the env reward (None where no feedback
+    applies). Task-agnostic mechanism; the category wording lives in ``SDPOConfig``.
+
+    Reward semantics (SQL three-valued {-1 bad format, 0 valid-but-wrong, +1 result-match}):
+      * reward >= success_reward_threshold -> None (a success; it becomes a *demonstration* for
+        its siblings, so it needs no failure feedback).
+      * reward < 0 (format invalid) -> split on whether the response committed a <solution>:
+        ``count("<solution>") == 0`` means it never committed (turn-exhaustion); ``>= 1`` means it
+        committed but the format was still rejected (malformed). The count is over the response
+        text only (the prompt's one-shot example is upstream and not included here).
+      * otherwise (valid format, wrong result) -> wrong-result feedback.
+    """
+    out: List[Optional[str]] = []
+    for reward, completion in zip(seq_rewards, completions):
+        if reward >= cfg.success_reward_threshold:
+            out.append(None)
+        elif reward < 0:
+            if completion.count("<solution>") == 0:
+                out.append(cfg.feedback_no_commit)
+            else:
+                out.append(cfg.feedback_malformed)
+        else:
+            out.append(cfg.feedback_wrong_result)
+    return out
+
+
 def _left_pad_concat(
     hindsight_prompt_ids: List[List[int]],
     response_ids_list: List[List[int]],
@@ -115,6 +159,7 @@ def build_self_distillation_tensors(
     uids: Sequence[Any],
     cfg,
     feedback: Optional[Sequence[Optional[str]]] = None,
+    ground_truth: Optional[Sequence[Any]] = None,
     apply_chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the per-sample teacher inputs for SDPO.
@@ -129,6 +174,11 @@ def build_self_distillation_tensors(
         cfg: ``SDPOConfig``.
         feedback: optional per-sample environment-feedback strings (None disables per sample). Left
             unused by the SQL minimal port; the seam for tau-bench user-sim / tool feedback.
+        ground_truth: optional per-sample gold answers. When ``cfg.use_ground_truth_demonstration`` is
+            set, the gold is framed as a *reference solution* + anti-copy transition (via
+            ``cfg.ground_truth_reference_template`` + ``ground_truth_transition_prompt``) and REPLACES the
+            sibling-demo / feedback hindsight prompt for the targeted samples (OPSD non-reason_first;
+            label leak; works with n_samples=1). Ignored when the flag is off or the entry is None.
         apply_chat_template_kwargs: extra kwargs forwarded to ``tokenizer.apply_chat_template``
             (e.g. ``{"enable_thinking": True}``).
 
@@ -138,6 +188,7 @@ def build_self_distillation_tensors(
     """
     batch_size = len(response_ids)
     feedback = list(feedback) if feedback is not None else [None] * batch_size
+    ground_truth = list(ground_truth) if ground_truth is not None else [None] * batch_size
     chat_kwargs = dict(apply_chat_template_kwargs or {})
     pad_token_id = tokenizer.pad_token_id
 
@@ -148,8 +199,10 @@ def build_self_distillation_tensors(
     distillation_flags: List[float] = []
     num_with_demo = 0
     num_with_feedback_used = 0
+    num_with_ground_truth = 0
+    use_gt = getattr(cfg, "use_ground_truth_demonstration", False)
     for i in range(batch_size):
-        demonstration = get_demonstration(
+        sibling_demo = get_demonstration(
             i,
             success_by_uid,
             uids,
@@ -157,21 +210,39 @@ def build_self_distillation_tensors(
             cfg.dont_reprompt_on_self_success,
             cfg.remove_thinking_from_demonstration,
         )
-        has_demo = demonstration is not None
-
-        raw_feedback = feedback[i] if cfg.include_environment_feedback else None
-        if raw_feedback is not None and not (isinstance(raw_feedback, str) and raw_feedback.strip()):
-            raw_feedback = None
-        # Optionally only use feedback when there is no demonstration.
-        use_feedback = raw_feedback is not None and (
-            not cfg.environment_feedback_only_without_solution or not has_demo
+        # OPSD-style gold conditioning: gate on use_ground_truth_demonstration (optionally only on failures).
+        gold_i = ground_truth[i]
+        use_gold = (
+            use_gt
+            and gold_i is not None
+            and str(gold_i).strip() != ""
+            and (not cfg.ground_truth_only_on_failure or seq_rewards[i] < cfg.success_reward_threshold)
         )
-        feedback_text = raw_feedback if use_feedback else None
+        has_sibling_demo = sibling_demo is not None
 
         messages = prompt_messages[i]
         prefix = list(messages[:-1])
         prompt_text = messages[-1]["content"]
-        hindsight_text = build_hindsight_prompt_text(prompt_text, demonstration, feedback_text, cfg)
+
+        if use_gold:
+            # Gold framed as a reference + anti-copy "derive it yourself" transition (OPSD non-reason_first).
+            # Replaces the sibling-demo / feedback path entirely for this sample.
+            hindsight_text = build_ground_truth_hindsight_text(prompt_text, str(gold_i).strip(), cfg)
+            has_demo = True
+            use_feedback = False
+            num_with_ground_truth += 1
+        else:
+            raw_feedback = feedback[i] if cfg.include_environment_feedback else None
+            if raw_feedback is not None and not (isinstance(raw_feedback, str) and raw_feedback.strip()):
+                raw_feedback = None
+            has_demo = sibling_demo is not None
+            # Optionally only use feedback when there is no demonstration.
+            use_feedback = raw_feedback is not None and (
+                not cfg.environment_feedback_only_without_solution or not has_demo
+            )
+            feedback_text = raw_feedback if use_feedback else None
+            hindsight_text = build_hindsight_prompt_text(prompt_text, sibling_demo, feedback_text, cfg)
+
         teacher_messages = prefix + [{"role": "user", "content": hindsight_text}]
 
         # Render to text then tokenize explicitly: apply_chat_template(tokenize=True) can return a
@@ -195,7 +266,7 @@ def build_self_distillation_tensors(
 
         hindsight_prompt_ids.append(ids)
         distillation_flags.append(1.0 if (has_demo or use_feedback) else 0.0)
-        num_with_demo += int(has_demo)
+        num_with_demo += int(has_sibling_demo)
         num_with_feedback_used += int(use_feedback)
 
     teacher_sequences, teacher_attention_mask = _left_pad_concat(
@@ -209,6 +280,7 @@ def build_self_distillation_tensors(
         "sdpo/success_group_fraction": (num_success_groups / num_groups) if num_groups else 0.0,
         "sdpo/success_sample_fraction": num_with_demo / batch_size if batch_size else 0.0,
         "sdpo/feedback_used_fraction": num_with_feedback_used / batch_size if batch_size else 0.0,
+        "sdpo/ground_truth_used_fraction": num_with_ground_truth / batch_size if batch_size else 0.0,
         "sdpo/reprompt_sample_fraction": float(self_distillation_mask.mean().item()),
     }
     return {

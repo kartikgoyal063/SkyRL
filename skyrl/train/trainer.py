@@ -40,7 +40,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
-from skyrl.backends.skyrl_train.utils.sdpo import build_self_distillation_tensors
+from skyrl.backends.skyrl_train.utils.sdpo import build_self_distillation_tensors, build_sdpo_feedback
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
@@ -347,7 +347,11 @@ class RayPPOTrainer:
                     if self.cfg.trainer.algorithm.policy_loss_type == "sdpo":
                         with Timer("build_self_distillation_inputs", self.all_timings):
                             training_input = self._add_self_distillation_inputs(
-                                training_input, generator_output, generator_input["prompts"], uids
+                                training_input,
+                                generator_output,
+                                generator_input["prompts"],
+                                uids,
+                                generator_input.get("env_extras"),
                             )
 
                     # 4. Inference and calculate values, log probs, rewards, kl divergence
@@ -1252,6 +1256,7 @@ class RayPPOTrainer:
         generator_output: GeneratorOutput,
         prompts: List,
         uids: List[str],
+        env_extras: Optional[List] = None,
     ) -> TrainingInputBatch:
         """Attach SDPO teacher (hindsight-conditioned) inputs to the training batch.
 
@@ -1274,13 +1279,42 @@ class RayPPOTrainer:
         # Per-sample scalar sequence reward (matches verl's reward_tensor.sum(-1)).
         seq_rewards = training_input["rewards"][:num_real].sum(dim=-1).tolist()
 
+        sdpo_cfg = self.cfg.trainer.algorithm.sdpo
+        # Environment feedback: tell each FAILED rollout why it failed (format / turn-exhaustion /
+        # wrong-result), embedded top-level in the teacher's hindsight prompt. Failed samples with
+        # no successful sibling still get mask=1 here (feedback-only conditioning), so no group is
+        # discarded. Classification is on the response text (excludes the prompt's one-shot example).
+        feedback = None
+        if sdpo_cfg.include_environment_feedback:
+            completions = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in response_ids]
+            feedback = build_sdpo_feedback(seq_rewards, completions, sdpo_cfg)
+
+        # OPSD-style gold conditioning: pull each sample's gold answer from env_extras
+        # (reward_spec.ground_truth) so it can replace the sibling demonstration. Only consumed when
+        # sdpo.use_ground_truth_demonstration is set; otherwise the builder ignores it.
+        ground_truth = None
+        if getattr(sdpo_cfg, "use_ground_truth_demonstration", False):
+            if env_extras is not None and len(env_extras) >= num_real:
+                ground_truth = [
+                    (ee.get("reward_spec", {}) or {}).get("ground_truth") if isinstance(ee, dict) else None
+                    for ee in env_extras[:num_real]
+                ]
+            else:
+                logger.warning(
+                    "[sdpo] use_ground_truth_demonstration=true but env_extras unavailable/misaligned "
+                    f"(have {0 if env_extras is None else len(env_extras)}, need {num_real}); "
+                    "no gold will be injected this step."
+                )
+
         built = build_self_distillation_tensors(
             tokenizer=self.tokenizer,
             prompt_messages=prompts,
             response_ids=response_ids,
             seq_rewards=seq_rewards,
             uids=list(uids[:num_real]),
-            cfg=self.cfg.trainer.algorithm.sdpo,
+            cfg=sdpo_cfg,
+            feedback=feedback,
+            ground_truth=ground_truth,
         )
 
         # Pad teacher tensors up to the (already padded) batch size. Padded rows are masked out via

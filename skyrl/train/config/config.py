@@ -423,9 +423,65 @@ class SDPOConfig(BaseConfig):
     SQL minimal port leaves this off and relies on the sibling demonstration alone."""
     environment_feedback_only_without_solution: bool = False
     """If True, only use feedback when no successful demonstration exists for that sample."""
-    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+    use_ground_truth_demonstration: bool = False
+    """OPSD-style mode: fill the hindsight ``{solution}`` slot with the per-sample GOLD answer
+    (``reward_spec.ground_truth``) instead of a successful sibling rollout. This deliberately LEAKS the
+    label into the teacher's context (the teacher then distills "knowing the answer" into the
+    unconditioned student over the student's own rollout tokens), so it works with n_samples=1 (no
+    siblings needed). Requires ``ground_truth`` to be plumbed into ``build_self_distillation_tensors``.
+    Off by default; the leak-free SDPO path is unaffected."""
+    ground_truth_demonstration_template: str = "<solution>\n{ground_truth}\n</solution>"
+    """Legacy: how the bare gold was wrapped for the old ``solution_template`` framing. Unused by the
+    current OPSD prompt (see ``ground_truth_reference_template`` / ``ground_truth_transition_prompt``)."""
+    ground_truth_reference_template: str = (
+        "\n\nHere is a reference solution to this problem:\n"
+        "=== Reference Solution Begin ===\n"
+        "<solution>\n{ground_truth}\n</solution>\n"
+        "=== Reference Solution End ===\n"
+    )
+    """OPSD-style framing of the gold as a *reference solution* inside the teacher's hindsight prompt."""
+    ground_truth_transition_prompt: str = (
+        "\nAfter studying the reference solution above, make sure you truly understand why it correctly "
+        "answers the question against the given database schema — do not copy or paraphrase it. Now, "
+        "using your own independent reasoning, work through the problem yourself: reason inside "
+        "<think>...</think>, explore the database with <sql>...</sql> queries when it helps, and don't be "
+        "afraid to backtrack or reconsider if something doesn't work out. When you are confident, commit "
+        "your final query inside a single <solution>...</solution> block.\n"
+    )
+    """OPSD anti-copy transition appended after the reference: pushes the teacher off literal answer-
+    copying and onto a genuine independent-reasoning trajectory the answer-blind student can approximate."""
+    ground_truth_only_on_failure: bool = False
+    """If True, only gold-condition rollouts that did NOT clear ``success_reward_threshold`` (focus the
+    signal on failures). Default False = gold-condition every rollout (successes contribute ~0 loss)."""
+    reprompt_template: str = "{prompt}{feedback}{solution}\n\nCorrectly solve the original question.\n"
+    """Hindsight prompt layout. ``{feedback}`` precedes ``{solution}`` so the teacher reads
+    "your earlier attempt failed because X" before being shown a correct sibling demonstration.
+    When either section is empty the surrounding text collapses cleanly (empty string)."""
     solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
     feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+    # Per-category feedback strings (used by ``build_sdpo_feedback``; keyed on the env reward).
+    # Default wording is SQL-flavored; override per task via the config.
+    feedback_no_commit: str = (
+        "Your earlier attempt never produced a final answer: you used all of your turns exploring "
+        "the database with <sql> queries and reached the turn limit without writing a <solution>. "
+        "Decide on your final query before you run out of turns -- once your exploratory queries give "
+        "you enough information, stop exploring and commit your final SQL inside a single "
+        "<solution>...</solution> block."
+    )
+    """Feedback for a format-fail (reward < 0) that never committed a <solution> (turn-exhaustion)."""
+    feedback_malformed: str = (
+        "Your earlier attempt did not follow the required format. Put all reasoning inside "
+        "<think>...</think> blocks and your final query inside exactly one <solution>...</solution> "
+        "block, with no <think>, <sql>, or <observation> tags inside the solution."
+    )
+    """Feedback for a format-fail (reward < 0) that committed >=1 <solution> but was still rejected."""
+    feedback_wrong_result: str = (
+        "Your earlier attempt was a well-formed query, but when executed it did not return what the "
+        "question asked for. Re-examine the schema and the question -- check the selected columns, the "
+        "joins between tables, the filter conditions, and any grouping or aggregation -- then write a "
+        "corrected query inside <solution>...</solution>."
+    )
+    """Feedback for a valid-format-but-wrong-result sample (reward == 0)."""
 
 
 @dataclass
