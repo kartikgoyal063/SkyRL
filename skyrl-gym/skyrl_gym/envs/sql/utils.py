@@ -100,13 +100,14 @@ def execute_sql_wrapper_single(db_file, sql, timeout, output_str):
     return res
 
 
-def calculate_reward_single(completion, reference, db_file, timeout=30):
+def calculate_reward_single(completion, reference, db_file, timeout=30, binary=False):
     reward = 0.0
     num_comparisons = 0
 
     is_valid, _, pred_sql, _ = verify_format_and_extract(completion)
     if not is_valid:
-        reward = -1.0
+        # binary: a malformed output scores 0 (same as valid-but-wrong); three-valued: -1.
+        reward = 0.0 if binary else -1.0
         return reward
     else:
         num_comparisons += 1
@@ -124,9 +125,9 @@ def calculate_reward_single(completion, reference, db_file, timeout=30):
     return reward
 
 
-def compute_score_single(completion, reference, db_file):
+def compute_score_single(completion, reference, db_file, binary=False):
     try:
-        res = calculate_reward_single(completion, reference, db_file)
+        res = calculate_reward_single(completion, reference, db_file, binary=binary)
         return res
     except Exception as e:
         print(f"Unexpected error: {e}; Setting reward as 0")

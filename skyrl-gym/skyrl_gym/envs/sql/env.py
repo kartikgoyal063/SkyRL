@@ -12,6 +12,11 @@ from dataclasses import dataclass
 @dataclass
 class Text2SQLEnvConfig:
     db_path: str = "/home/ray/default/sql_data"
+    binary_reward: bool = False
+    """If True, reward is binary: 1.0 iff (format valid AND execution matches gold), else 0.0 (a
+    malformed output and a valid-but-wrong query both score 0). Default False = three-valued
+    {-1 malformed, 0 valid-but-wrong, +1 match}. Used to match SDPO's binary success signal for a
+    direct GRPO-vs-SDPO comparison."""
 
 
 class SQLEnv(BaseTextEnv):
@@ -28,6 +33,7 @@ class SQLEnv(BaseTextEnv):
         assert "data" in extras, "data field is required"
 
         self.db_path = env_config.db_path
+        self.binary_reward = getattr(env_config, "binary_reward", False)
         self.db_id = extras["db_id"]
         self.gold_sql = extras["reward_spec"]["ground_truth"]
         self.task = extras["data"]
@@ -85,7 +91,7 @@ class SQLEnv(BaseTextEnv):
         if done:
             # Concat all chat history into a single string and compute reward
             chat_history_str = "".join([item["content"] for item in self.chat_history])
-            return compute_score_single(chat_history_str, self.gold_sql, self.db_file)
+            return compute_score_single(chat_history_str, self.gold_sql, self.db_file, binary=self.binary_reward)
         else:
             # No reward for intermediate steps for SQL tasks
             return 0
