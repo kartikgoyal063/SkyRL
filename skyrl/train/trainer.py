@@ -1286,8 +1286,23 @@ class RayPPOTrainer:
         # discarded. Classification is on the response text (excludes the prompt's one-shot example).
         feedback = None
         if sdpo_cfg.include_environment_feedback:
-            completions = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in response_ids]
-            feedback = build_sdpo_feedback(seq_rewards, completions, sdpo_cfg)
+            # Prefer env-rendered feedback carried per-sample in generator_output["env_metrics"]
+            # under "sdpo_feedback" (multi-turn envs that have rich terminal state, e.g. tau2's
+            # reward_info diagnosis). The string survives metric aggregation (non-numerics are
+            # dropped from the aggregate, kept in the per-row dict). Falls back to the reward-sign /
+            # response-text classifier (build_sdpo_feedback) for envs that don't supply it (e.g. SQL).
+            env_metrics = generator_output.get("env_metrics")
+            env_fb = None
+            if env_metrics is not None and len(env_metrics) >= num_real:
+                env_fb = [
+                    (em.get("sdpo_feedback") if isinstance(em, dict) else None)
+                    for em in env_metrics[:num_real]
+                ]
+            if env_fb is not None and any(f is not None for f in env_fb):
+                feedback = env_fb
+            else:
+                completions = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in response_ids]
+                feedback = build_sdpo_feedback(seq_rewards, completions, sdpo_cfg)
 
         # OPSD-style gold conditioning: pull each sample's gold answer from env_extras
         # (reward_spec.ground_truth) so it can replace the sibling demonstration. Only consumed when
