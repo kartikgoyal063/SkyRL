@@ -253,6 +253,10 @@ def dump_per_dataset_eval_results(
     # Prepare common data
     input_prompts = [tokenizer.decode(prompt) for prompt in concat_generator_outputs["prompt_token_ids"]]
     output_responses = [tokenizer.decode(response) for response in concat_generator_outputs["response_ids"]]
+    # Per-row env metrics (one dict per row) — carries env-specific detail (e.g. tau2's full
+    # reward_info / errors / feedback string) alongside the scalar score. May be absent for envs
+    # that don't emit it; guard with None.
+    env_metrics = concat_generator_outputs.get("env_metrics")
 
     # Group indices by data source
     data_source_indices = {}
@@ -278,6 +282,7 @@ def dump_per_dataset_eval_results(
                     "env_class": concat_all_envs[i],
                     "env_extras": concat_env_extras[i],
                     "data_source": data_source,
+                    "env_metrics": env_metrics[i] if env_metrics is not None else None,
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

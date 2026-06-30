@@ -787,6 +787,9 @@ class TrainerConfig(BaseConfig):
     """Pack samples into the THD layout and strip intra-microbatch padding (requires flash attention)."""
     eval_batch_size: int = 1024
     eval_before_train: bool = True
+    eval_only: bool = False
+    """Run the baseline eval (eval_before_train) and then exit before any training. For
+    no-training eval/rollout passes that only need the dumped trajectories + metrics."""
     eval_interval: int = 5
     """``-1`` to disable evaluation."""
     max_prompt_length: int = 512

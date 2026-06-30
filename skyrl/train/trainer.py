@@ -256,13 +256,21 @@ class RayPPOTrainer:
 
         # Eval before training. Wrapped in eval callbacks + on_log so that e.g.
         # a best-checkpoint callback sees the baseline reading.
-        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
+        if self.cfg.trainer.eval_interval > 0 and (self.cfg.trainer.eval_before_train or self.cfg.trainer.eval_only):
             self._fire("on_eval_start")
             with Timer("eval", self.all_timings):
                 eval_metrics = await self.eval()
             self._fire("on_eval_end", metrics=eval_metrics)
             self._fire("on_log", logs=eval_metrics)
             self.tracker.log(eval_metrics, step=self.global_step, commit=True)
+
+        # eval-only: the baseline eval above already dumped trajectories + metrics; stop here so a
+        # no-training pass doesn't spend rollout/user-sim budget on gradient steps we'd discard.
+        if self.cfg.trainer.eval_only:
+            logger.info("trainer.eval_only=True: baseline eval complete; exiting before training.")
+            if self.colocate_all:
+                await self.inference_engine_client.sleep()
+            return
 
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
