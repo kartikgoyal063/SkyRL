@@ -40,7 +40,11 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     get_kl_controller,
 )
-from skyrl.backends.skyrl_train.utils.sdpo import build_self_distillation_tensors, build_sdpo_feedback
+from skyrl.backends.skyrl_train.utils.sdpo import (
+    build_hero_perturn_tensors,
+    build_self_distillation_tensors,
+    build_sdpo_feedback,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
@@ -327,6 +331,16 @@ class RayPPOTrainer:
                             # update progress bar for current batch (but not global step)
                             pbar.update(1)
                             continue
+
+                    # HERO Axis-B: run the in-loop self-reflector while the engine is still awake
+                    # (must precede the colocate sleep below). Produces per-turn hints consumed by the
+                    # per-turn teacher-tensor builder in _add_self_distillation_inputs.
+                    self._hero_hints = None
+                    if self._hero_per_turn_enabled():
+                        with Timer("hero_reflect", self.all_timings):
+                            self._hero_hints = await self._generate_hero_reflections(
+                                generator_input, generator_output
+                            )
 
                     if self.colocate_all:
                         # if we are not continuing sampling, we sleep the inference engine
@@ -1273,6 +1287,8 @@ class RayPPOTrainer:
         ``teacher_attention_mask`` + ``self_distillation_mask`` aligned with the (already padded)
         ``training_input``. Task-agnostic — all behavior is driven by ``algorithm.sdpo`` config.
         """
+        if self._hero_per_turn_enabled():
+            return self._add_hero_perturn_inputs(training_input, generator_output, prompts)
         response_ids = generator_output["response_ids"]
         num_real = len(response_ids)
         # Rebuilding the teacher prompt from chat messages needs per-sample prompt/response alignment,
@@ -1361,6 +1377,100 @@ class RayPPOTrainer:
 
         for k, v in built["metrics"].items():
             self.all_metrics[k] = v
+        return training_input
+
+    # ── HERO faithful per-turn self-distillation (Axis-B) ──────────────────────
+
+    def _hero_per_turn_enabled(self) -> bool:
+        algo = self.cfg.trainer.algorithm
+        return algo.policy_loss_type == "sdpo" and bool(getattr(algo.sdpo, "hero_per_turn", False))
+
+    async def _generate_hero_reflections(self, generator_input, generator_output) -> List[dict]:
+        """In-loop self-reflection (HERO Chunk 3b): the CURRENT policy reflects on each fresh rollout →
+        per-turn hints. Runs while the inference engine is awake (before the colocate sleep). Returns a
+        list of ``{turnN: hint}`` dicts aligned to ``generator_output['response_ids']`` (``{}`` where
+        the rollout has no parseable reflection)."""
+        from reverie.offline.hero_perturn import build_reflector_prompts, parse_reflector_hints
+
+        prompts = generator_input["prompts"]
+        response_ids = generator_output["response_ids"]
+        n = len(response_ids)
+        if len(prompts) != n:
+            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({n}); skipping reflection.")
+            return [{} for _ in range(n)]
+
+        hero_cfg = self.cfg.trainer.algorithm.sdpo
+        response_texts = [self.tokenizer.decode(r, skip_special_tokens=False) for r in response_ids]
+        raw_rewards = generator_output.get("rewards") or []
+        seq_rewards = []
+        for i in range(n):
+            r = raw_rewards[i] if i < len(raw_rewards) else 0.0
+            seq_rewards.append(float(sum(r)) if isinstance(r, (list, tuple)) else float(r))
+
+        user_prompts = build_reflector_prompts(
+            prompts[:n], response_texts, seq_rewards, include_think=hero_cfg.hero_reflector_thinking
+        )
+        chat_kwargs = {"enable_thinking": hero_cfg.hero_reflector_thinking}
+        prompt_token_ids = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True, **chat_kwargs
+            )
+            for p in user_prompts
+        ]
+
+        from omegaconf import OmegaConf
+
+        sp_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.generator.sampling_params, resolve=True))
+        sp_cfg.temperature = hero_cfg.hero_reflector_temperature
+        if "top_p" in sp_cfg:
+            sp_cfg.top_p = hero_cfg.hero_reflector_top_p
+        sp_cfg.max_generate_length = hero_cfg.hero_reflector_max_tokens
+        reflector_sp = get_sampling_params_for_backend(
+            self.cfg.generator.inference_engine.backend, sp_cfg
+        )
+        out = await self.inference_engine_client.generate(
+            {"prompt_token_ids": prompt_token_ids, "sampling_params": reflector_sp}
+        )
+        hints = parse_reflector_hints(out["responses"])
+        self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
+        return hints
+
+    def _add_hero_perturn_inputs(self, training_input, generator_output, prompts) -> TrainingInputBatch:
+        """Build per-turn teacher tensors from the in-loop reflector hints and stash them in
+        ``training_input.metadata['hero']`` (``M`` rows ≠ ``batch_size``, so not batch fields). Chunk 4's
+        policy worker reads them for the per-turn JSD loss."""
+        response_ids = generator_output["response_ids"]
+        num_real = len(response_ids)
+        if len(prompts) != num_real:
+            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({num_real}); skipping per-turn SD.")
+            return training_input
+
+        hints = getattr(self, "_hero_hints", None) or [{} for _ in range(num_real)]
+        seq_rewards = training_input["rewards"][:num_real].sum(dim=-1).tolist()
+        loss_mask = training_input["loss_mask"]
+        # loss_mask is left-padded to max_response_len; the real per-token weights are the trailing
+        # len(response_ids[i]) entries, aligned position-for-position with response_ids[i].
+        loss_masks = [loss_mask[i][-len(response_ids[i]):].tolist() for i in range(num_real)]
+        chat_kwargs = dict(getattr(self.cfg.generator, "chat_template_kwargs", {}) or {})
+
+        built = build_hero_perturn_tensors(
+            tokenizer=self.tokenizer,
+            prompt_messages=prompts,
+            response_ids=response_ids,
+            loss_masks=loss_masks,
+            hints=hints[:num_real],
+            seq_rewards=seq_rewards,
+            cfg=self.cfg.trainer.algorithm.sdpo,
+            apply_chat_template_kwargs=chat_kwargs,
+        )
+        for k, v in built.get("metrics", {}).items():
+            self.all_metrics[k] = v
+        training_input.metadata["hero"] = {
+            k: built[k]
+            for k in ("teacher_sequences", "teacher_attention_mask",
+                      "hero_sample_idx", "hero_y_start", "hero_y_end", "hero_y_len")
+            if built.get(k) is not None
+        }
         return training_input
 
     @torch.no_grad()

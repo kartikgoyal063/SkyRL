@@ -453,6 +453,22 @@ class SDPOConfig(BaseConfig):
     ground_truth_only_on_failure: bool = False
     """If True, only gold-condition rollouts that did NOT clear ``success_reward_threshold`` (focus the
     signal on failures). Default False = gold-condition every rollout (successes contribute ~0 loss)."""
+
+    # ── HERO faithful per-turn self-distillation (Axis-B; arXiv 2606.11559) ──
+    hero_per_turn: bool = False
+    """Enable HERO faithful per-turn SD: after each rollout an in-loop self-reflector emits per-turn
+    hints; the teacher re-scores EACH turn's tokens under H_t + a Fig-3 feedback block (vs the standard
+    one-teacher-row-per-sample top-level path). Requires ``reverie`` on PYTHONPATH."""
+    hero_scrub_args: bool = False
+    """Drop the reflector's suggested-action arguments from the injected hint (reflection_gold guard)."""
+    hero_reflector_temperature: float = 0.6
+    """Sampling temperature for the in-loop reflector pass (HERO uses the policy itself as reflector)."""
+    hero_reflector_max_tokens: int = 2048
+    """Max new tokens for the reflector's JSON (thinking needs room)."""
+    hero_reflector_thinking: bool = True
+    """Render the reflector prompt with Qwen ``enable_thinking`` (decode like training, per config)."""
+    hero_reflector_top_p: float = 0.95
+    """Nucleus for the reflector pass."""
     reprompt_template: str = "{prompt}{feedback}{solution}\n\nCorrectly solve the original question.\n"
     """Hindsight prompt layout. ``{feedback}`` precedes ``{solution}`` so the teacher reads
     "your earlier attempt failed because X" before being shown a correct sibling demonstration.
