@@ -41,7 +41,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     get_kl_controller,
 )
 from skyrl.backends.skyrl_train.utils.sdpo import (
-    build_hero_perturn_tensors,
+    _left_pad_concat,
     build_self_distillation_tensors,
     build_sdpo_feedback,
 )
@@ -365,8 +365,20 @@ class RayPPOTrainer:
                     with Timer("convert_to_training_input", self.all_timings):
                         training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
 
-                    # 3b. SDPO: build teacher (hindsight-conditioned) inputs from successful siblings.
-                    if self.cfg.trainer.algorithm.policy_loss_type == "sdpo":
+                    # 3b. HERO per-turn (Axis-B): REPLACE the batch with per-turn examples; else the
+                    # standard SDPO path appends teacher inputs to the trajectory batch.
+                    if self._hero_per_turn_enabled():
+                        with Timer("build_hero_perturn_inputs", self.all_timings):
+                            hero_ti = self._build_hero_training_input(
+                                generator_output, generator_input["prompts"]
+                            )
+                        if hero_ti is None:
+                            # no problematic turns this step -> nothing to distill; skip the update
+                            # (mirror dynamic-sampling's skip; the logical step completes on a later batch).
+                            pbar.update(1)
+                            continue
+                        training_input = hero_ti
+                    elif self.cfg.trainer.algorithm.policy_loss_type == "sdpo":
                         with Timer("build_self_distillation_inputs", self.all_timings):
                             training_input = self._add_self_distillation_inputs(
                                 training_input,
@@ -1287,8 +1299,6 @@ class RayPPOTrainer:
         ``teacher_attention_mask`` + ``self_distillation_mask`` aligned with the (already padded)
         ``training_input``. Task-agnostic — all behavior is driven by ``algorithm.sdpo`` config.
         """
-        if self._hero_per_turn_enabled():
-            return self._add_hero_perturn_inputs(training_input, generator_output, prompts)
         response_ids = generator_output["response_ids"]
         num_real = len(response_ids)
         # Rebuilding the teacher prompt from chat messages needs per-sample prompt/response alignment,
@@ -1411,20 +1421,28 @@ class RayPPOTrainer:
             prompts[:n], response_texts, seq_rewards, include_think=hero_cfg.hero_reflector_thinking
         )
         chat_kwargs = {"enable_thinking": hero_cfg.hero_reflector_thinking}
-        prompt_token_ids = [
-            self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True, **chat_kwargs
+        # Two-step (render text -> tokenize): apply_chat_template(tokenize=True) can return a
+        # BatchEncoding (version-dependent), which isn't JSON-serializable for the engine call.
+        prompt_token_ids = []
+        for p in user_prompts:
+            text = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True, **chat_kwargs
             )
-            for p in user_prompts
-        ]
+            prompt_token_ids.append(self.tokenizer(text, add_special_tokens=False)["input_ids"])
 
         from omegaconf import OmegaConf
 
-        sp_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.generator.sampling_params, resolve=True))
-        sp_cfg.temperature = hero_cfg.hero_reflector_temperature
-        if "top_p" in sp_cfg:
-            sp_cfg.top_p = hero_cfg.hero_reflector_top_p
-        sp_cfg.max_generate_length = hero_cfg.hero_reflector_max_tokens
+        # Override temp/top_p/max-gen while PRESERVING the structured SamplingParams type (merge keeps
+        # the first arg's type; to_container+create would demote it to a plain DictConfig and
+        # get_sampling_params_for_backend rejects that).
+        sp_cfg = OmegaConf.merge(
+            self.cfg.generator.sampling_params,
+            {
+                "temperature": hero_cfg.hero_reflector_temperature,
+                "top_p": hero_cfg.hero_reflector_top_p,
+                "max_generate_length": hero_cfg.hero_reflector_max_tokens,
+            },
+        )
         reflector_sp = get_sampling_params_for_backend(
             self.cfg.generator.inference_engine.backend, sp_cfg
         )
@@ -1435,43 +1453,97 @@ class RayPPOTrainer:
         self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
         return hints
 
-    def _add_hero_perturn_inputs(self, training_input, generator_output, prompts) -> TrainingInputBatch:
-        """Build per-turn teacher tensors from the in-loop reflector hints and stash them in
-        ``training_input.metadata['hero']`` (``M`` rows ≠ ``batch_size``, so not batch fields). Chunk 4's
-        policy worker reads them for the per-turn JSD loss."""
+    def _build_hero_training_input(self, generator_output, prompts) -> Optional[TrainingInputBatch]:
+        """HERO Axis-B: expand the trajectory batch into per-turn **training examples** (Eq 1) and return
+        a fresh :class:`TrainingInputBatch` of ``M`` rows — each scoring one turn's ``y_t`` under the real
+        student history (``sequences``) vs the reframed teacher context (``teacher_sequences``).
+
+        Reuses :meth:`convert_to_training_input` for the student side (feed per-turn ``prompt=real H_t`` /
+        ``response=y_t``) and ``_left_pad_concat`` for the teacher rows, so the existing SDPO loss runs
+        unchanged. Returns ``None`` when no turn is problematic this step (caller skips the update)."""
+        from reverie.offline.hero_perturn import build_perturn_examples
+
         response_ids = generator_output["response_ids"]
-        num_real = len(response_ids)
-        if len(prompts) != num_real:
-            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({num_real}); skipping per-turn SD.")
-            return training_input
+        n = len(response_ids)
+        if len(prompts) != n:
+            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({n}); skipping per-turn SD.")
+            return None
+        hints = getattr(self, "_hero_hints", None) or [{} for _ in range(n)]
+        raw_rewards = generator_output.get("rewards") or [0.0] * n
+        seq_rewards = [
+            float(sum(r)) if isinstance(r, (list, tuple)) else float(r) for r in raw_rewards[:n]
+        ]
+        sdpo_cfg = self.cfg.trainer.algorithm.sdpo
 
-        hints = getattr(self, "_hero_hints", None) or [{} for _ in range(num_real)]
-        seq_rewards = training_input["rewards"][:num_real].sum(dim=-1).tolist()
-        loss_mask = training_input["loss_mask"]
-        # loss_mask is left-padded to max_response_len; the real per-token weights are the trailing
-        # len(response_ids[i]) entries, aligned position-for-position with response_ids[i].
-        loss_masks = [loss_mask[i][-len(response_ids[i]):].tolist() for i in range(num_real)]
-        chat_kwargs = dict(getattr(self.cfg.generator, "chat_template_kwargs", {}) or {})
-
-        built = build_hero_perturn_tensors(
-            tokenizer=self.tokenizer,
+        ex = build_perturn_examples(
+            self.tokenizer,
             prompt_messages=prompts,
+            prompt_token_ids=generator_output["prompt_token_ids"],
             response_ids=response_ids,
-            loss_masks=loss_masks,
-            hints=hints[:num_real],
+            loss_masks=generator_output["loss_masks"],
+            hints=hints[:n],
             seq_rewards=seq_rewards,
-            cfg=self.cfg.trainer.algorithm.sdpo,
-            apply_chat_template_kwargs=chat_kwargs,
+            success_threshold=sdpo_cfg.success_reward_threshold,
+            scrub_args=sdpo_cfg.hero_scrub_args,
+            max_reprompt_len=sdpo_cfg.max_reprompt_len,
+            apply_chat_template_kwargs=dict(getattr(self.cfg.generator, "chat_template_kwargs", {}) or {}),
         )
-        for k, v in built.get("metrics", {}).items():
+        for k, v in ex["stats"].items():
             self.all_metrics[k] = v
-        training_input.metadata["hero"] = {
-            k: built[k]
-            for k in ("teacher_sequences", "teacher_attention_mask",
-                      "hero_sample_idx", "hero_y_start", "hero_y_end", "hero_y_len")
-            if built.get(k) is not None
-        }
-        return training_input
+
+        m = len(ex["y_ids"])
+        if m == 0:
+            logger.warning("[hero] no problematic turns this step; skipping update.")
+            return None
+
+        # Student batch: build tensors from per-turn (prompt = real H_t, response = y_t). We do NOT
+        # call convert_to_training_input because its boundary computation asserts num_prompts ==
+        # train_batch_size — untrue for the M per-turn rows. Each row is its own (stepwise) prompt,
+        # n_samples=1; rewards are dummy (pure SD ignores advantages), loss is over all y_t tokens.
+        uids = ex["uids"]
+        resp = ex["y_ids"]
+        dummy_rewards = [[0.0] * len(y) for y in resp]
+        all_ones = [[1] * len(y) for y in resp]
+        (seq_t, attn_t, resp_mask_t, rew_t, lm_t, rollout_lp_t, _) = convert_prompts_responses_to_batch_tensors(
+            self.tokenizer, ex["student_prefix"], resp, dummy_rewards, all_ones, None, None,
+            max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
+        )
+        ti = TrainingInputBatch({
+            "sequences": seq_t, "attention_mask": attn_t, "response_mask": resp_mask_t,
+            "rewards": rew_t, "loss_mask": lm_t, "rollout_logprobs": rollout_lp_t,
+            "rollout_expert_indices": None, "pixel_values": None, "image_grid_thw": None,
+        })
+        # Treat the M rows as M stepwise prompts in a single mini-batch (reuse the boundary helper with
+        # train_batch_size=mini_batch_size=M, is_stepwise=True → [(0, M)]).
+        ti.metadata = {"uids": uids}
+        ti.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
+            uids, m, m, True, 1
+        )
+        ti.metadata["policy_prompt_boundaries"] = compute_prompt_boundaries(uids)
+        ti.metadata["response_length"] = resp_mask_t.shape[1]
+        ti.metadata["avg_response_length"] = sum(len(y) for y in resp) / m
+
+        # Pad the student batch to an even multiple of dp_size (zeros loss_mask on padded rows).
+        dp_size = self.dispatch.get_lcm_dp_size()
+        pad_size = math.ceil(ti.batch_size / dp_size) * dp_size - ti.batch_size
+        ti = pad_training_input_batch(ti, pad_size)
+
+        # Teacher rows: reframed H̃_t + the SAME y_t ids, row-aligned + padded like the standard SDPO
+        # path (padded rows get self_distillation_mask=0 so they never contribute to the loss).
+        teacher_sequences, teacher_attention_mask = _left_pad_concat(
+            ex["teacher_prefix"], resp, self.tokenizer.pad_token_id
+        )
+        if pad_size > 0:
+            teacher_sequences = torch.cat([teacher_sequences, teacher_sequences[:1].repeat(pad_size, 1)], dim=0)
+            teacher_attention_mask = torch.cat(
+                [teacher_attention_mask, teacher_attention_mask[:1].repeat(pad_size, 1)], dim=0
+            )
+        ti["teacher_sequences"] = teacher_sequences
+        ti["teacher_attention_mask"] = teacher_attention_mask
+        ti["self_distillation_mask"] = torch.cat(
+            [torch.ones(m, 1, dtype=torch.float32), torch.zeros(pad_size, 1, dtype=torch.float32)], dim=0
+        )
+        return ti
 
     @torch.no_grad()
     def _compute_sdpo_loss_scale(
