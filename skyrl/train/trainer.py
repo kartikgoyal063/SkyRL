@@ -1420,6 +1420,15 @@ class RayPPOTrainer:
         user_prompts = build_reflector_prompts(
             prompts[:n], response_texts, seq_rewards, include_think=hero_cfg.hero_reflector_thinking
         )
+        if getattr(hero_cfg, "hero_reflector_backend", "self_vllm") == "gemini":
+            # External-critic reflector: generate hints with a strong API model (litellm) instead of the
+            # in-loop policy. NOT HERO self-distillation. Downstream (parse / is_problematic / teacher) unchanged.
+            responses = await self._gemini_reflect(user_prompts, hero_cfg)
+            hints = parse_reflector_hints(responses)
+            self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
+            if getattr(hero_cfg, "hero_dump_reflections", False):
+                self._dump_reflections(responses, hints, seq_rewards)
+            return hints
         chat_kwargs = {"enable_thinking": hero_cfg.hero_reflector_thinking}
         # Two-step (render text -> tokenize): apply_chat_template(tokenize=True) can return a
         # BatchEncoding (version-dependent), which isn't JSON-serializable for the engine call.
@@ -1451,7 +1460,73 @@ class RayPPOTrainer:
         )
         hints = parse_reflector_hints(out["responses"])
         self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
+        if getattr(hero_cfg, "hero_dump_reflections", False):
+            self._dump_reflections(out["responses"], hints, seq_rewards)
         return hints
+
+    async def _gemini_reflect(self, user_prompts, hero_cfg) -> list:
+        """External-critic reflector: run the same HERO reflector prompts through an API model (litellm),
+        concurrently. temperature / max_tokens come from hero_cfg; reasoning is left at the model default.
+        A failed call returns "" (-> empty hint -> that trajectory drops out of I(tau)). Reads GEMINI_API_KEY
+        from env, loading it from the tau2 .env if absent (the trainer process may not have it set)."""
+        import asyncio
+        import litellm
+
+        if not os.environ.get("GEMINI_API_KEY"):
+            envp = os.path.expanduser("~/reverie/benchmarks/tau2-bench/.env")
+            if os.path.exists(envp):
+                for line in open(envp):
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+        sem = asyncio.Semaphore(int(getattr(hero_cfg, "hero_reflector_api_max_concurrency", 8)))
+
+        async def _one(prompt: str) -> str:
+            async with sem:
+                try:
+                    r = await asyncio.wait_for(
+                        litellm.acompletion(
+                            model=hero_cfg.hero_reflector_api_model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=hero_cfg.hero_reflector_temperature,
+                            max_tokens=hero_cfg.hero_reflector_max_tokens,
+                        ),
+                        timeout=240,
+                    )
+                    return r.choices[0].message.content or ""
+                except Exception as e:  # noqa: BLE001 (incl. asyncio.TimeoutError -> drop this hint)
+                    logger.warning(f"[hero] gemini reflector call failed/timeout: {e}")
+                    return ""
+
+        return await asyncio.gather(*[_one(p) for p in user_prompts])
+
+    def _dump_reflections(self, responses, hints, seq_rewards) -> None:
+        """Append one JSONL line per trajectory (raw reflector text + parsed hints + which turns pass
+        is_problematic) to {export_path}/reflections/step_{step}.jsonl. Gated by hero_dump_reflections;
+        CPU-only, best-effort (never fails the step)."""
+        import json as _json
+        from reverie.offline.reflection import is_problematic
+
+        step = int(getattr(self, "global_step", 0) or 0)
+        out_dir = os.path.join(self.cfg.trainer.export_path, "reflections")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f"step_{step:04d}.jsonl"), "w") as f:
+                for i, (raw, hint) in enumerate(zip(responses, hints)):
+                    rew = float(seq_rewards[i]) if i < len(seq_rewards) else None
+                    probs = [k for k, h in (hint or {}).items() if is_problematic(h)]
+                    f.write(
+                        _json.dumps(
+                            {"step": step, "idx": i, "reward": rew,
+                             "raw": raw, "hints": hint, "problematic_turns": probs},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[hero] reflection dump failed: {e}")
 
     def _build_hero_training_input(self, generator_output, prompts) -> Optional[TrainingInputBatch]:
         """HERO Axis-B: expand the trajectory batch into per-turn **training examples** (Eq 1) and return

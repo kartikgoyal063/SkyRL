@@ -393,8 +393,10 @@ class SDPOConfig(BaseConfig):
     """Minimum per-sample sequence reward for a sibling rollout to be a usable demonstration."""
     teacher_regularization: str = "none"
     """How to anchor the self-teacher (prevents the live teacher diverging — SDPO Table 4 / OPSD). "none" =
-    live current policy (unregularized; can diverge). "fixed_initial" = teacher is theta_ref = the base model
-    (LoRA disabled), i.e. OPSD's frozen-initial teacher. "ema" = EMA of the student adapter (not yet implemented)."""
+    live current policy (unregularized; can diverge). "fixed_initial" = teacher is theta_ref = the frozen
+    initial model: under LoRA the adapter is disabled (base == theta_ref); under full FT (lora.rank==0) the
+    worker holds a separate FSDP-sharded frozen copy of the initial weights and runs the teacher forward
+    through it. "ema" = EMA of the student adapter (LoRA only; not yet implemented for full FT)."""
     teacher_update_rate: float = 0.05
     """EMA decay rate for teacher_regularization="ema" (SDPO main-run value); unused otherwise."""
     dont_reprompt_on_self_success: bool = True
@@ -463,12 +465,27 @@ class SDPOConfig(BaseConfig):
     """Drop the reflector's suggested-action arguments from the injected hint (reflection_gold guard)."""
     hero_reflector_temperature: float = 0.6
     """Sampling temperature for the in-loop reflector pass (HERO uses the policy itself as reflector)."""
-    hero_reflector_max_tokens: int = 2048
-    """Max new tokens for the reflector's JSON (thinking needs room)."""
+    hero_reflector_max_tokens: int = 16384
+    """Max new tokens for the reflector's JSON. NOTE: for the "gemini" backend with thinking on, this
+    budget is SHARED between Gemini's reasoning and the JSON output. On long multi-turn trajectories
+    heavy reasoning squeezed the JSON so it truncated mid-output -> parse failures -> dropped hints
+    (esp. on the failed/long trajectories we most want). Default raised 2048->16384; raise further, or
+    set hero_reflector_thinking=false / cap reasoning, if truncation recurs on very long trajectories."""
     hero_reflector_thinking: bool = True
     """Render the reflector prompt with Qwen ``enable_thinking`` (decode like training, per config)."""
     hero_reflector_top_p: float = 0.95
     """Nucleus for the reflector pass."""
+    hero_reflector_backend: str = "self_vllm"
+    """Reflector generation backend: "self_vllm" (in-loop policy via the colocated vLLM engines — HERO
+    self-distillation) or "gemini" (external critic via litellm; NOT self-distillation). For "gemini",
+    hero_reflector_temperature / hero_reflector_max_tokens apply; reasoning is left at the model default."""
+    hero_reflector_api_model: str = "gemini/gemini-3.1-pro-preview"
+    """litellm model string used when hero_reflector_backend="gemini" (reads GEMINI_API_KEY from env)."""
+    hero_reflector_api_max_concurrency: int = 8
+    """Max concurrent reflector API calls per step when hero_reflector_backend="gemini"."""
+    hero_dump_reflections: bool = False
+    """Dump per-step reflector output (raw text + parsed hints + which turns pass is_problematic) to
+    {export_path}/reflections/step_XXXX.jsonl. Off by default; CPU-only, ~KB/step, best-effort."""
     reprompt_template: str = "{prompt}{feedback}{solution}\n\nCorrectly solve the original question.\n"
     """Hindsight prompt layout. ``{feedback}`` precedes ``{solution}`` so the teacher reads
     "your earlier attempt failed because X" before being shown a correct sibling demonstration.

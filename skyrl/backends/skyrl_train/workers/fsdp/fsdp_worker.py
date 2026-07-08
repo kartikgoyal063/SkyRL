@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import ray
 import torch
 import torch.distributed
+from loguru import logger
 from transformers import AutoConfig
 
 from skyrl.train.utils.trainer_utils import (
@@ -213,6 +214,55 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             and self.cfg.algorithm.sdpo.teacher_regularization == "ema"
         ):
             self.model.ema_update_teacher(1.0)
+
+        # SDPO full-FT frozen-initial teacher (Approach A). Under LoRA, `fixed_initial` recovers theta_ref
+        # for free by disabling the adapter (see HFModelWrapper.forward). Full FT has no adapter, so we hold
+        # a SECOND frozen copy of the INITIAL weights (== base model, since we init from base) and run the
+        # teacher forward through it. FSDP-wrapped on the SAME strategy/mesh as the policy -> identical
+        # sharding (so a future EMA update is a local-shard blend), eval + no optimizer.
+        self.teacher_model = None
+        if (
+            self.cfg.algorithm.policy_loss_type == "sdpo"
+            and self.cfg.algorithm.sdpo.teacher_regularization == "fixed_initial"
+            and self.cfg.policy.model.lora.rank == 0
+        ):
+            teacher_wrapped = HFModelWrapper(
+                model_path,
+                use_flash_attention_2=self.cfg.flash_attn,
+                bf16=self.cfg.policy.inference_only_init,
+                lora_rank=0,
+                sequence_parallel_size=self.cfg.policy.sequence_parallel_size,
+                remove_microbatch_padding=self.cfg.remove_microbatch_padding,
+                use_torch_compile=self.cfg.policy.use_torch_compile,
+                rope_scaling=get_rope_scaling_config(self.cfg),
+                rope_theta=get_rope_theta_config(self.cfg),
+                model_config_kwargs=self.cfg.policy.model_config_kwargs,
+                meta_init=use_meta,
+                language_model_only=self.cfg.policy.language_model_only,
+                logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+                create_ema_teacher_adapter=False,
+            )
+            self._seq_parallel_monkey_patch(model=teacher_wrapped.model)
+            # Bare (non-tuple) arg -> strategy._fsdp_init_eval_model: FSDP-shard with no optimizer.
+            self.teacher_model = strategy.prepare(teacher_wrapped)
+            self.teacher_model.eval()
+            for p in self.teacher_model.model.parameters():
+                p.requires_grad_(False)
+            logger.info(
+                f"[SDPO] full-FT frozen-initial teacher created (FSDP-sharded eval copy of {model_path}); "
+                "teacher forward routed to self.teacher_model, offload/backload wired into the colocate cycle."
+            )
+
+    def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
+        super().offload_to_cpu(offload_optimizer=offload_optimizer, offload_model=offload_model)
+        # SDPO full-FT frozen teacher: keep it in lockstep with the policy across the colocate cycle.
+        if getattr(self, "teacher_model", None) is not None and offload_model:
+            self.strategy.offload_to_cpu(self.teacher_model, None, offload_optimizer=False, offload_model=True)
+
+    def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
+        super().backload_to_gpu(backload_optimizer=backload_optimizer, backload_model=backload_model)
+        if getattr(self, "teacher_model", None) is not None and backload_model:
+            self.strategy.backload_to_gpu(self.teacher_model, None, backload_optimizer=False, backload_model=True)
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers

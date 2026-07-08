@@ -818,6 +818,15 @@ class PolicyWorkerBase(Worker):
             if (resolved_loss_name == "sdpo" and loss_config.sdpo.teacher_regularization == "ema")
             else None
         )
+        # Full-FT frozen-initial teacher: no LoRA adapter to disable, so route the teacher forward through
+        # the separate frozen sibling held by the FSDP worker (see init_model). getattr keeps this safe on
+        # backends / configs without a teacher_model (-> falls back to the adapter path above).
+        sdpo_teacher_module = getattr(self, "teacher_model", None)
+        sdpo_use_frozen_teacher = (
+            resolved_loss_name == "sdpo"
+            and loss_config.sdpo.teacher_regularization == "fixed_initial"
+            and sdpo_teacher_module is not None
+        )
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -843,10 +852,16 @@ class PolicyWorkerBase(Worker):
                 assert (
                     experience.teacher_sequences is not None and experience.sdpo_loss_scale is not None
                 ), "policy_loss_type='sdpo' requires teacher_sequences + sdpo_loss_scale in the batch"
+                # Frozen full-FT teacher -> the separate sibling module; otherwise the policy itself with the
+                # adapter-based regularization (disable_adapter / ema). The frozen sibling has no adapter, so
+                # neither adapter flag applies to it.
+                teacher_fwd_model = sdpo_teacher_module if sdpo_use_frozen_teacher else self.model
+                teacher_disable_adapter = sdpo_teacher_disable_adapter and not sdpo_use_frozen_teacher
+                teacher_fwd_adapter = None if sdpo_use_frozen_teacher else sdpo_teacher_adapter
                 with torch.no_grad():
                     if sdpo_full_logit:
                         # Teacher gathers top-k at the STUDENT's indices so both distributions share support.
-                        teacher_log_probs, teacher_out = self.model(
+                        teacher_log_probs, teacher_out = teacher_fwd_model(
                             experience.teacher_sequences,
                             num_actions,
                             attention_mask=experience.teacher_attention_mask,
@@ -854,19 +869,19 @@ class PolicyWorkerBase(Worker):
                             return_output=True,
                             return_topk_logp=sdpo_topk,
                             topk_indices=output["topk_idx"],
-                            disable_adapter=sdpo_teacher_disable_adapter,
-                            teacher_adapter=sdpo_teacher_adapter,
+                            disable_adapter=teacher_disable_adapter,
+                            teacher_adapter=teacher_fwd_adapter,
                         )
                         teacher_topk_logp = teacher_out["topk_logp"]
                     else:
-                        teacher_log_probs = self.model(
+                        teacher_log_probs = teacher_fwd_model(
                             experience.teacher_sequences,
                             num_actions,
                             attention_mask=experience.teacher_attention_mask,
                             temperature=self.cfg.algorithm.temperature,
                             return_output=False,
-                            disable_adapter=sdpo_teacher_disable_adapter,
-                            teacher_adapter=sdpo_teacher_adapter,
+                            disable_adapter=teacher_disable_adapter,
+                            teacher_adapter=teacher_fwd_adapter,
                         )
                         teacher_topk_logp = None
                 policy_loss, loss_metrics = compute_sdpo_loss(
