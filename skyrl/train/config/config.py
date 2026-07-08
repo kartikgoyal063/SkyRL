@@ -486,6 +486,11 @@ class SDPOConfig(BaseConfig):
     hero_dump_reflections: bool = False
     """Dump per-step reflector output (raw text + parsed hints + which turns pass is_problematic) to
     {export_path}/reflections/step_XXXX.jsonl. Off by default; CPU-only, ~KB/step, best-effort."""
+    hero_reflect_on_success: bool = False
+    """Reflect on SUCCESSFUL trajectories too? Default False = HERO's premise (feedback on UNSUCCESSFUL
+    attempts): trajectories with reward >= success_reward_threshold are skipped entirely — no reflector
+    call (saves API cost) and no per-turn rows. Set True to reflect on every rollout (the old behavior,
+    which distilled policy-compliance nitpicks onto already-correct rollouts)."""
     reprompt_template: str = "{prompt}{feedback}{solution}\n\nCorrectly solve the original question.\n"
     """Hindsight prompt layout. ``{feedback}`` precedes ``{solution}`` so the teacher reads
     "your earlier attempt failed because X" before being shown a correct sibling demonstration.

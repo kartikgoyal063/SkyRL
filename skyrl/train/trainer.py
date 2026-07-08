@@ -1400,7 +1400,11 @@ class RayPPOTrainer:
         per-turn hints. Runs while the inference engine is awake (before the colocate sleep). Returns a
         list of ``{turnN: hint}`` dicts aligned to ``generator_output['response_ids']`` (``{}`` where
         the rollout has no parseable reflection)."""
-        from reverie.offline.hero_perturn import build_reflector_prompts, parse_reflector_hints
+        from reverie.offline.hero_perturn import (
+            build_reflector_prompts,
+            parse_reflector_hints,
+            reflect_indices,
+        )
 
         prompts = generator_input["prompts"]
         response_ids = generator_output["response_ids"]
@@ -1417,18 +1421,49 @@ class RayPPOTrainer:
             r = raw_rewards[i] if i < len(raw_rewards) else 0.0
             seq_rewards.append(float(sum(r)) if isinstance(r, (list, tuple)) else float(r))
 
-        user_prompts = build_reflector_prompts(
-            prompts[:n], response_texts, seq_rewards, include_think=hero_cfg.hero_reflector_thinking
+        # HERO reflects on UNSUCCESSFUL attempts: by default skip successful trajectories entirely — no
+        # reflector call (saves API cost) and no per-turn rows. `reflect_idx` maps subset -> full index.
+        reflect_idx = reflect_indices(
+            seq_rewards,
+            success_threshold=float(getattr(hero_cfg, "success_reward_threshold", 1.0)),
+            reflect_on_success=bool(getattr(hero_cfg, "hero_reflect_on_success", False)),
+        )
+        self.all_metrics["hero/n_reflected"] = len(reflect_idx)
+        self.all_metrics["hero/frac_reflected"] = len(reflect_idx) / max(n, 1)
+
+        hints: List[dict] = [{} for _ in range(n)]
+        responses_full = ["(skipped: successful trajectory)"] * n
+        if not reflect_idx:
+            self.all_metrics["hero/reflector_parse_ok_frac"] = 0.0
+            if getattr(hero_cfg, "hero_dump_reflections", False):
+                self._dump_reflections(responses_full, hints, seq_rewards)
+            return hints
+
+        sub_prompts = build_reflector_prompts(
+            [prompts[i] for i in reflect_idx],
+            [response_texts[i] for i in reflect_idx],
+            [seq_rewards[i] for i in reflect_idx],
+            include_think=hero_cfg.hero_reflector_thinking,
         )
         if getattr(hero_cfg, "hero_reflector_backend", "self_vllm") == "gemini":
             # External-critic reflector: generate hints with a strong API model (litellm) instead of the
             # in-loop policy. NOT HERO self-distillation. Downstream (parse / is_problematic / teacher) unchanged.
-            responses = await self._gemini_reflect(user_prompts, hero_cfg)
-            hints = parse_reflector_hints(responses)
-            self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
-            if getattr(hero_cfg, "hero_dump_reflections", False):
-                self._dump_reflections(responses, hints, seq_rewards)
-            return hints
+            sub_responses = await self._gemini_reflect(sub_prompts, hero_cfg)
+        else:
+            sub_responses = await self._vllm_reflect(sub_prompts, hero_cfg)
+
+        sub_hints = parse_reflector_hints(sub_responses)
+        for j, i in enumerate(reflect_idx):
+            hints[i] = sub_hints[j]
+            responses_full[i] = sub_responses[j]
+        self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in sub_hints if h) / len(reflect_idx)
+        if getattr(hero_cfg, "hero_dump_reflections", False):
+            self._dump_reflections(responses_full, hints, seq_rewards)
+        return hints
+
+    async def _vllm_reflect(self, user_prompts, hero_cfg) -> list:
+        """Self-vllm reflector: run the HERO reflector prompts through the colocated inference engine
+        (the in-loop policy = HERO self-distillation). Returns raw response texts aligned to user_prompts."""
         chat_kwargs = {"enable_thinking": hero_cfg.hero_reflector_thinking}
         # Two-step (render text -> tokenize): apply_chat_template(tokenize=True) can return a
         # BatchEncoding (version-dependent), which isn't JSON-serializable for the engine call.
@@ -1458,11 +1493,7 @@ class RayPPOTrainer:
         out = await self.inference_engine_client.generate(
             {"prompt_token_ids": prompt_token_ids, "sampling_params": reflector_sp}
         )
-        hints = parse_reflector_hints(out["responses"])
-        self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in hints if h) / max(n, 1)
-        if getattr(hero_cfg, "hero_dump_reflections", False):
-            self._dump_reflections(out["responses"], hints, seq_rewards)
-        return hints
+        return out["responses"]
 
     async def _gemini_reflect(self, user_prompts, hero_cfg) -> list:
         """External-critic reflector: run the same HERO reflector prompts through an API model (litellm),
