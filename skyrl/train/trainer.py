@@ -1436,7 +1436,7 @@ class RayPPOTrainer:
         if not reflect_idx:
             self.all_metrics["hero/reflector_parse_ok_frac"] = 0.0
             if getattr(hero_cfg, "hero_dump_reflections", False):
-                self._dump_reflections(responses_full, hints, seq_rewards)
+                self._dump_reflections(responses_full, hints, seq_rewards, response_texts, prompts)
             return hints
 
         sub_prompts = build_reflector_prompts(
@@ -1458,7 +1458,7 @@ class RayPPOTrainer:
             responses_full[i] = sub_responses[j]
         self.all_metrics["hero/reflector_parse_ok_frac"] = sum(1 for h in sub_hints if h) / len(reflect_idx)
         if getattr(hero_cfg, "hero_dump_reflections", False):
-            self._dump_reflections(responses_full, hints, seq_rewards)
+            self._dump_reflections(responses_full, hints, seq_rewards, response_texts, prompts)
         return hints
 
     async def _vllm_reflect(self, user_prompts, hero_cfg) -> list:
@@ -1533,12 +1533,14 @@ class RayPPOTrainer:
 
         return await asyncio.gather(*[_one(p) for p in user_prompts])
 
-    def _dump_reflections(self, responses, hints, seq_rewards) -> None:
-        """Append one JSONL line per trajectory (raw reflector text + parsed hints + which turns pass
-        is_problematic) to {export_path}/reflections/step_{step}.jsonl. Gated by hero_dump_reflections;
-        CPU-only, best-effort (never fails the step)."""
+    def _dump_reflections(self, responses, hints, seq_rewards, transcripts=None, prompts=None) -> None:
+        """Append one JSONL line per trajectory to {export_path}/reflections/step_{step}.jsonl. Each line
+        carries the WHOLE rollout so a reader can see what the reflector saw: the task context, the full
+        decoded transcript (rollout), the raw reflector text, the parsed per-turn hints, and which turns
+        pass is_problematic. Gated by hero_dump_reflections; CPU-only, best-effort (never fails the step)."""
         import json as _json
         from reverie.offline.reflection import is_problematic
+        from reverie.offline.hero_perturn import _prompt_to_task_context
 
         step = int(getattr(self, "global_step", 0) or 0)
         out_dir = os.path.join(self.cfg.trainer.export_path, "reflections")
@@ -1548,14 +1550,16 @@ class RayPPOTrainer:
                 for i, (raw, hint) in enumerate(zip(responses, hints)):
                     rew = float(seq_rewards[i]) if i < len(seq_rewards) else None
                     probs = [k for k, h in (hint or {}).items() if is_problematic(h)]
-                    f.write(
-                        _json.dumps(
-                            {"step": step, "idx": i, "reward": rew,
-                             "raw": raw, "hints": hint, "problematic_turns": probs},
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
+                    rec = {"step": step, "idx": i, "reward": rew}
+                    if prompts is not None and i < len(prompts):
+                        try:
+                            rec["task"] = _prompt_to_task_context(prompts[i])
+                        except Exception:  # noqa: BLE001
+                            rec["task"] = None
+                    if transcripts is not None and i < len(transcripts):
+                        rec["transcript"] = transcripts[i]
+                    rec.update({"raw": raw, "hints": hint, "problematic_turns": probs})
+                    f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[hero] reflection dump failed: {e}")
 
