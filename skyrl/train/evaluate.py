@@ -17,6 +17,7 @@ from skyrl.train.generators.base import (
     GeneratorOutput,
 )
 from skyrl.train.generators.utils import (
+    compute_pass_hat_k,
     concatenate_generator_outputs,
     get_metrics_from_generator_output,
     prepare_generator_input,
@@ -103,6 +104,12 @@ async def evaluate(
             "eval/all/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
     )
+
+    # tau-bench pass^k reliability curve (pass^1..n); pass^1 == avg_score for binary reward.
+    for k, v in compute_pass_hat_k(
+        concat_generator_outputs, concat_uids, cfg.generator.eval_n_samples_per_prompt
+    ).items():
+        eval_metrics[f"eval/all/pass_hat_{k}"] = v
 
     for key, value in concat_generator_outputs["rollout_metrics"].items():
         eval_metrics[f"eval/all/{key}"] = value
@@ -223,6 +230,12 @@ async def evaluate_step_wise(
             "eval/all/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
     )
+
+    # tau-bench pass^k reliability curve (pass^1..n); pass^1 == avg_score for binary reward.
+    for k, v in compute_pass_hat_k(
+        generator_output_last_step, uids_last_step, cfg.generator.eval_n_samples_per_prompt
+    ).items():
+        eval_metrics[f"eval/all/pass_hat_{k}"] = v
 
     # 4. Prepare dumping data
     # TODO[Ben] update this to be cloud-compatible

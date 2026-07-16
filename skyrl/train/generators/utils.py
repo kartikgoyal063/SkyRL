@@ -1,6 +1,7 @@
 import copy
 import os
 from collections import defaultdict
+from math import comb
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -230,6 +231,29 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
         pass_at_n=pass_at_n,
         mean_positive_reward=mean_positive_reward,
     )
+
+
+def compute_pass_hat_k(generator_output: GeneratorOutput, uids: List[str], max_k: int) -> Dict[int, float]:
+    """tau-bench-style pass^k (reliability): for each task with n trials of which c succeed,
+    the probability that a random k-subset of its trials ALL succeed is C(c,k)/C(n,k). Averaged
+    over tasks with >= k trials. Returns {k: value} for k=1..max_k.
+
+    success = trajectory reward > 0 (same predicate as pass@n). For binary reward, pass^1 equals
+    the micro success rate (== `avg_score`) -- a built-in sanity check. pass^k is monotonically
+    non-increasing in k; pass^n = fraction of tasks solved on every trial.
+    Mirrors reverie.offline.probe_metrics._phat so live and post-hoc curves agree.
+    """
+    rewards = generator_output["rewards"]
+    uid_to_rewards: Dict[str, List[float]] = defaultdict(list)
+    for i, r in enumerate(rewards):
+        scalar = r[-1] if isinstance(r, list) else r  # per-token -> last token's reward
+        uid_to_rewards[uids[i]].append(scalar)
+    out: Dict[int, float] = {}
+    for k in range(1, max_k + 1):
+        # comb(c, k) == 0 when c < k, so a task that can't field k successes contributes 0.
+        vals = [comb(sum(1 for x in rs if x > 0), k) / comb(len(rs), k) for rs in uid_to_rewards.values() if len(rs) >= k]
+        out[k] = float(np.mean(vals)) if vals else float("nan")
+    return out
 
 
 def _flatten_field(generator_outputs: List[GeneratorOutput], key: str) -> list:
