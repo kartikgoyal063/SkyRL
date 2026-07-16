@@ -840,6 +840,10 @@ class TrainerConfig(BaseConfig):
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
+    dump_train_rollouts: bool = False
+    """Dump per-step TRAIN rollouts (human-readable, same row shape as the eval dump) to
+    export_path/dumped_train_rollouts/global_step_<N>.jsonl. Persists env_metrics.messages that
+    ride every rollout's GeneratorOutput. Off by default; report runs set it True."""
     rope_scaling: Optional[Dict[str, Any]] = None
     rope_theta: Optional[float] = None
     log_example_interval: int = 1

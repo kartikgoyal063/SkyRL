@@ -296,6 +296,42 @@ def dump_per_dataset_eval_results(
     logger.info(f"Dumped aggregated eval metrics to {aggregated_filename}")
 
 
+def dump_train_rollouts(
+    dump_dir_path: Path,
+    tokenizer: AutoTokenizer,
+    generator_output: GeneratorOutput,
+    uids: List[str],
+    global_step: int,
+) -> None:
+    """Dump one training step's rollouts to a jsonl, one entry per rollout.
+
+    Mirrors ``dump_per_dataset_eval_results``'s row shape (input_prompt / output_response / score /
+    stop_reason / env_metrics) so TRAIN rollouts land in the same analyzable JSON as the eval dumps.
+    The readable conversation lives in ``env_metrics.messages`` (tau2_env.get_metrics), which rides
+    every rollout's GeneratorOutput regardless of train/eval — the eval path already persists it;
+    here we do the same for the training rollouts.
+    """
+    dump_dir_path.mkdir(parents=True, exist_ok=True)
+    prompts = generator_output["prompt_token_ids"]
+    responses = generator_output["response_ids"]
+    rewards = generator_output["rewards"]
+    stop_reasons = generator_output.get("stop_reasons") or [None] * len(prompts)
+    env_metrics = generator_output.get("env_metrics")
+    filename = dump_dir_path / f"{GLOBAL_STEP_PREFIX}{global_step}.jsonl"
+    with open(filename, "w") as f:
+        for i in range(len(prompts)):
+            entry = {
+                "uid": uids[i] if uids is not None and i < len(uids) else None,
+                "input_prompt": tokenizer.decode(prompts[i]),
+                "output_response": tokenizer.decode(responses[i]),
+                "score": rewards[i],
+                "stop_reason": stop_reasons[i],
+                "env_metrics": env_metrics[i] if env_metrics is not None else None,
+            }
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    logger.info(f"Dumped {len(prompts)} train rollouts (step {global_step}) to {filename}")
+
+
 class DynamicSamplingState(TypedDict, total=False):
     """Schema for dynamic sampling state dictionary.
 

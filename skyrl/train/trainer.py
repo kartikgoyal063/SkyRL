@@ -88,6 +88,7 @@ from skyrl.train.utils.trainer_utils import (
     ResumeMode,
     build_dataloader,
     cleanup_old_checkpoints,
+    dump_train_rollouts,
     extract_step_from_path,
     run_on_each_node,
     validate_consistency_for_latest_checkpoint,
@@ -349,6 +350,20 @@ class RayPPOTrainer:
                     # 1.2 postprocess rewards (and merge step-wise turns if enabled)
                     with Timer("postprocess_generator_output", self.all_timings):
                         generator_output, uids = self.postprocess_generator_output(generator_output, uids)
+
+                    # 1.3 dump readable TRAIN rollouts (same row shape as the eval dumps) — persists the
+                    # env_metrics.messages that ride every rollout's generator_output. For HERO the
+                    # training_input is later replaced by per-turn fragments, so we dump here (full
+                    # trajectories) before that transform.
+                    if self.cfg.trainer.dump_train_rollouts:
+                        with Timer("dump_train_rollouts", self.all_timings):
+                            dump_train_rollouts(
+                                Path(self.cfg.trainer.export_path) / "dumped_train_rollouts",
+                                self.tokenizer,
+                                generator_output,
+                                uids,
+                                self.global_step,
+                            )
 
                     # 2. print example just for debugging
                     log_interval = self.cfg.trainer.log_example_interval
