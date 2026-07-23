@@ -333,11 +333,11 @@ class RayPPOTrainer:
                             pbar.update(1)
                             continue
 
-                    # HERO Axis-B: run the in-loop self-reflector while the engine is still awake
-                    # (must precede the colocate sleep below). Produces per-turn hints consumed by the
-                    # per-turn teacher-tensor builder in _add_self_distillation_inputs.
+                    # HERO: run the reviewer (LOCATE/reflect) while the engine is still awake (must
+                    # precede the colocate sleep below). Skipped for gold+top_level (no located turns
+                    # needed). Produces per-turn hints consumed by the HERO teacher-data pipeline.
                     self._hero_hints = None
-                    if self._hero_per_turn_enabled():
+                    if self._hero_enabled() and self._hero_needs_reviewer():
                         with Timer("hero_reflect", self.all_timings):
                             self._hero_hints = await self._generate_hero_reflections(
                                 generator_input, generator_output
@@ -380,12 +380,12 @@ class RayPPOTrainer:
                     with Timer("convert_to_training_input", self.all_timings):
                         training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
 
-                    # 3b. HERO per-turn (Axis-B): REPLACE the batch with per-turn examples; else the
-                    # standard SDPO path appends teacher inputs to the trajectory batch.
-                    if self._hero_per_turn_enabled():
+                    # 3b. HERO: REPLACE the batch with the modular teacher-data pipeline's rows (per_turn
+                    # or top_level); else the non-HERO SDPO path appends sibling teacher inputs.
+                    if self._hero_enabled():
                         with Timer("build_hero_perturn_inputs", self.all_timings):
                             hero_ti = self._build_hero_training_input(
-                                generator_output, generator_input["prompts"]
+                                generator_output, generator_input["prompts"], generator_input.get("env_extras")
                             )
                         if hero_ti is None:
                             # no problematic turns this step -> nothing to distill; skip the update
@@ -1406,9 +1406,22 @@ class RayPPOTrainer:
 
     # ── HERO faithful per-turn self-distillation (Axis-B) ──────────────────────
 
-    def _hero_per_turn_enabled(self) -> bool:
+    def _hero_enabled(self) -> bool:
+        """Modular HERO pipeline (reverie.hero) is active when policy_loss_type=='sdpo' and BOTH axis
+        flags are set. Non-HERO sdpo (feedback_type/placement None) uses the sibling path."""
         algo = self.cfg.trainer.algorithm
-        return algo.policy_loss_type == "sdpo" and bool(getattr(algo.sdpo, "hero_per_turn", False))
+        s = algo.sdpo
+        return (
+            algo.policy_loss_type == "sdpo"
+            and getattr(s, "feedback_type", None) is not None
+            and getattr(s, "placement", None) is not None
+        )
+
+    def _hero_needs_reviewer(self) -> bool:
+        """Reviewer pass (LOCATE turns / WRITE diagnoses) is needed for everything except gold+top_level,
+        which injects the whole-task gold with no located turns — so that combo skips the reviewer."""
+        s = self.cfg.trainer.algorithm.sdpo
+        return not (getattr(s, "feedback_type", None) == "gold" and getattr(s, "placement", None) == "top_level")
 
     async def _generate_hero_reflections(self, generator_input, generator_output) -> List[dict]:
         """In-loop self-reflection (HERO Chunk 3b): the CURRENT policy reflects on each fresh rollout →
@@ -1578,20 +1591,22 @@ class RayPPOTrainer:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[hero] reflection dump failed: {e}")
 
-    def _build_hero_training_input(self, generator_output, prompts) -> Optional[TrainingInputBatch]:
-        """HERO Axis-B: expand the trajectory batch into per-turn **training examples** (Eq 1) and return
-        a fresh :class:`TrainingInputBatch` of ``M`` rows — each scoring one turn's ``y_t`` under the real
-        student history (``sequences``) vs the reframed teacher context (``teacher_sequences``).
+    def _build_hero_training_input(self, generator_output, prompts, env_extras=None) -> Optional[TrainingInputBatch]:
+        """HERO: run the modular teacher-data pipeline (reverie.hero) for this step and return a fresh
+        :class:`TrainingInputBatch` — one row per placement unit (a problematic turn for ``per_turn``, a
+        whole failed trajectory for ``top_level``), each scoring ``y`` under the real student context vs
+        the feedback-reframed teacher context. The SDPO loss runs unchanged. Returns ``None`` when the
+        pipeline yields no rows (caller skips the update).
 
-        Reuses :meth:`convert_to_training_input` for the student side (feed per-turn ``prompt=real H_t`` /
-        ``response=y_t``) and ``_left_pad_concat`` for the teacher rows, so the existing SDPO loss runs
-        unchanged. Returns ``None`` when no turn is problematic this step (caller skips the update)."""
-        from reverie.offline.hero_perturn import build_perturn_examples
+        AXES: ``sdpo.feedback_type`` (reflection|review_raw|gold) x ``sdpo.placement`` (per_turn|top_level)
+        x G. Reviewer hints (``self._hero_hints``) were produced upstream while the engine was awake;
+        ``gold`` pulls its pre-rendered target from ``env_extras[i].reward_spec.ground_truth``."""
+        from reverie.hero.pipeline import build_teacher_batch
 
         response_ids = generator_output["response_ids"]
         n = len(response_ids)
         if len(prompts) != n:
-            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({n}); skipping per-turn SD.")
+            logger.warning(f"[hero] prompts ({len(prompts)}) != responses ({n}); skipping HERO SD.")
             return None
         hints = getattr(self, "_hero_hints", None) or [{} for _ in range(n)]
         raw_rewards = generator_output.get("rewards") or [0.0] * n
@@ -1600,14 +1615,31 @@ class RayPPOTrainer:
         ]
         sdpo_cfg = self.cfg.trainer.algorithm.sdpo
 
-        ex = build_perturn_examples(
+        gold_texts = None
+        if getattr(sdpo_cfg, "feedback_type", None) == "gold":
+            if env_extras is not None and len(env_extras) >= n:
+                gold_texts = [
+                    (e.get("reward_spec", {}) or {}).get("ground_truth") if isinstance(e, dict) else None
+                    for e in env_extras[:n]
+                ]
+            else:
+                logger.warning(
+                    "[hero] feedback_type=gold but env_extras unavailable/misaligned "
+                    f"(have {0 if env_extras is None else len(env_extras)}, need {n}); no gold this step."
+                )
+
+        ex = build_teacher_batch(
             self.tokenizer,
+            feedback_type=sdpo_cfg.feedback_type,
+            placement=sdpo_cfg.placement,
             prompt_messages=prompts,
             prompt_token_ids=generator_output["prompt_token_ids"],
             response_ids=response_ids,
+            response_texts=[self.tokenizer.decode(r, skip_special_tokens=False) for r in response_ids],
             loss_masks=generator_output["loss_masks"],
             hints=hints[:n],
             seq_rewards=seq_rewards,
+            gold_texts=gold_texts,
             success_threshold=sdpo_cfg.success_reward_threshold,
             scrub_args=sdpo_cfg.hero_scrub_args,
             max_reprompt_len=sdpo_cfg.max_reprompt_len,
@@ -1628,9 +1660,11 @@ class RayPPOTrainer:
         uids = ex["uids"]
         resp = ex["y_ids"]
         dummy_rewards = [[0.0] * len(y) for y in resp]
-        all_ones = [[1] * len(y) for y in resp]
+        # per_turn: y is a pure agent span -> all-ones. top_level: y is the FULL trajectory, so the
+        # placement supplies the ORIGINAL per-token loss mask (agent tokens only).
+        loss_masks = ex.get("loss_masks") or [[1] * len(y) for y in resp]
         (seq_t, attn_t, resp_mask_t, rew_t, lm_t, rollout_lp_t, _) = convert_prompts_responses_to_batch_tensors(
-            self.tokenizer, ex["student_prefix"], resp, dummy_rewards, all_ones, None, None,
+            self.tokenizer, ex["student_prefix"], resp, dummy_rewards, loss_masks, None, None,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
         )
         ti = TrainingInputBatch({

@@ -456,6 +456,14 @@ class SDPOConfig(BaseConfig):
     """If True, only gold-condition rollouts that did NOT clear ``success_reward_threshold`` (focus the
     signal on failures). Default False = gold-condition every rollout (successes contribute ~0 loss)."""
 
+    # ── HERO modular teacher-data pipeline (reverie.hero; arXiv 2606.11559) ──
+    feedback_type: Optional[str] = None
+    """AXIS 2 — WHAT feedback the teacher sees (reverie.hero.feedback): reflection | review_raw | gold.
+    None = not a HERO run (sibling/sequence SDPO handles it). Set it (with placement) to enable the
+    modular HERO pipeline. Requires ``reverie`` on PYTHONPATH."""
+    placement: Optional[str] = None
+    """AXIS 3 — WHERE it goes (reverie.hero.placement): per_turn | top_level. Paired with feedback_type;
+    both must be set to enable the pipeline."""
     # ── HERO faithful per-turn self-distillation (Axis-B; arXiv 2606.11559) ──
     hero_per_turn: bool = False
     """Enable HERO faithful per-turn SD: after each rollout an in-loop self-reflector emits per-turn
