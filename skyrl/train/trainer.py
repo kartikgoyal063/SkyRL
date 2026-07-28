@@ -1518,9 +1518,20 @@ class RayPPOTrainer:
         reflector_sp = get_sampling_params_for_backend(
             self.cfg.generator.inference_engine.backend, sp_cfg
         )
-        out = await self.inference_engine_client.generate(
-            {"prompt_token_ids": prompt_token_ids, "sampling_params": reflector_sp}
-        )
+        use_base = bool(getattr(hero_cfg, "hero_reflector_use_base", False))
+        gen_input = {
+            "prompt_token_ids": prompt_token_ids,
+            "sampling_params": reflector_sp,
+            # colocated-engine path: skip the LoRA adapter -> base output.
+            "use_base_weights": use_base,
+        }
+        # Remote (LoRA weight-sync) path picks base-vs-adapter via `model` and REQUIRES it explicitly
+        # under weight-sync. To target the FROZEN BASE, name the base model (the client's model_name =
+        # what the server serves base under; fall back to the configured model path).
+        model_arg = None
+        if use_base:
+            model_arg = getattr(self.inference_engine_client, "model_name", None) or self.cfg.trainer.policy.model.path
+        out = await self.inference_engine_client.generate(gen_input, model=model_arg)
         return out["responses"]
 
     async def _gemini_reflect(self, user_prompts, hero_cfg) -> list:

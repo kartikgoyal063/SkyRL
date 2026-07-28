@@ -29,6 +29,9 @@ class InferenceEngineInput(TypedDict):
     sampling_params: Optional[Dict[str, Any]]
     session_ids: Optional[List[Hashable]]
     mm_features: Optional[List[MultiModalFeatures]]
+    # When True, serve the BASE model for this batch (skip the loaded LoRA adapter). Used by the
+    # HERO frozen-base reflector; absent/False => normal behaviour (adapter applied when enabled).
+    use_base_weights: Optional[bool]
 
 
 class InferenceEngineOutput(TypedDict):

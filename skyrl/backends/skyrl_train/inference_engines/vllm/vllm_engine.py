@@ -277,9 +277,10 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
 
-        # Check if LoRA is enabled and create LoRA requests
+        # Check if LoRA is enabled and create LoRA requests. use_base_weights (HERO frozen-base
+        # reflector) forces the BASE model for this batch by leaving lora_requests=None.
         lora_requests = None
-        if self._is_lora:
+        if self._is_lora and not input_batch.get("use_base_weights"):
             lora_int_ids = list(self.llm.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
@@ -493,13 +494,16 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         result = await self.llm.add_lora(lora_request)
         return result
 
-    async def _collect_outputs(self, prompt_token_ids, request_id: str, sampling_params: SamplingParams):
-        """Collect outputs for a single prompt."""
+    async def _collect_outputs(
+        self, prompt_token_ids, request_id: str, sampling_params: SamplingParams, use_base_weights: bool = False
+    ):
+        """Collect outputs for a single prompt. ``use_base_weights`` leaves lora_request=None so the
+        BASE model serves this request (HERO frozen-base reflector)."""
         # Check if LoRA is enabled and create LoRA request
         final_output = None
         lora_request = None
 
-        if self._is_lora:
+        if self._is_lora and not use_base_weights:
             lora_int_ids = list(await self.llm.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
@@ -521,13 +525,16 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         """Generate responses using vLLM's async engine."""
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        use_base_weights = bool(input_batch.get("use_base_weights"))  # HERO frozen-base reflector
 
         tasks = []
         for prompt in prompt_token_ids:
             # Schedule the collection of outputs for each prompt.
             # Avoid duplicate request_ids
             request_id = str(uuid4().hex)
-            task = asyncio.create_task(self._collect_outputs(prompt, request_id, sampling_params))
+            task = asyncio.create_task(
+                self._collect_outputs(prompt, request_id, sampling_params, use_base_weights=use_base_weights)
+            )
             tasks.append(task)
         outputs = await asyncio.gather(*tasks)
 

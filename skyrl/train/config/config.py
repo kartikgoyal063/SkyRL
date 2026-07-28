@@ -491,6 +491,10 @@ class SDPOConfig(BaseConfig):
     """litellm model string used when hero_reflector_backend="gemini" (reads GEMINI_API_KEY from env)."""
     hero_reflector_api_max_concurrency: int = 8
     """Max concurrent reflector API calls per step when hero_reflector_backend="gemini"."""
+    hero_reflector_use_base: bool = False
+    """self_vllm only: serve the FROZEN BASE (skip the LoRA adapter) for the reflector generation, so
+    the reflector == HERO's frozen-base teacher (a stable thinking critic) rather than the drifting
+    non-thinking policy. Reuses the base weights already resident in vLLM (no extra model)."""
     hero_dump_reflections: bool = False
     """Dump per-step reflector output (raw text + parsed hints + which turns pass is_problematic) to
     {export_path}/reflections/step_XXXX.jsonl. Off by default; CPU-only, ~KB/step, best-effort."""
